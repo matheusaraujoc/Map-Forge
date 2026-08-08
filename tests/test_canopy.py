@@ -3,9 +3,14 @@
 import numpy as np
 from shapely.geometry import Polygon
 
-from mapforge.core.features import Forest, Park, FeatureKind, MapData
 from mapforge.core.geo import BBox
-from mapforge.generation.vegetation import SPACING, _scatter, _spacing_for_budget
+from mapforge.generation.vegetation import (
+    SHELL_BORDER_M,
+    SPACING,
+    _scatter,
+    _spacing_for_budget,
+    _split_shell,
+)
 from mapforge.imagery.canopy import CanopyMap, _polygonize, detect_canopy
 
 BBOX = BBox(-2.9100, -41.9180, -2.8974, -41.9054)
@@ -74,32 +79,18 @@ def test_imagem_sem_verde_nao_inventa_vegetacao():
     assert mapa.canopy_polygons == []
 
 
-def _mapa_com_mata(area_m2: float) -> MapData:
-    lado = float(np.sqrt(area_m2))
-    md = MapData(bbox=BBOX)
-    md.forests.append(
-        Forest(
-            osm_id=-1,
-            kind=FeatureKind.FOREST,
-            tags={"source": "deteccao"},
-            geometry=Polygon([(0, 0), (lado, 0), (lado, lado), (0, lado)]),
-        )
-    )
-    return md
-
-
 def test_orcamento_nao_mexe_quando_ja_cabe():
-    assert _spacing_for_budget(_mapa_com_mata(10_000), 12.0, 40_000) == 1.0
+    assert _spacing_for_budget([("forest", 10_000.0)], 0, 12.0, 40_000) == 1.0
 
 
 def test_orcamento_afasta_as_arvores_em_vez_de_cortar_a_lista():
-    md = _mapa_com_mata(4_000_000)  # 400 ha
-    fator = _spacing_for_budget(md, 12.0, 5_000)
+    area = 4_000_000.0  # 400 ha
+    fator = _spacing_for_budget([("forest", area)], 0, 12.0, 5_000)
 
     assert fator > 1.0
     # Com o espacamento corrigido, a estimativa passa a caber no teto.
     passo = 12.0 * fator * SPACING["forest"]
-    assert md.forests[0].geometry.area / (passo * passo) * 0.72 <= 5_001
+    assert area / (passo * passo) * 0.72 <= 5_001
 
 
 def test_mancha_pequena_ainda_recebe_uma_arvore():
@@ -115,14 +106,80 @@ def test_mancha_pequena_ainda_recebe_uma_arvore():
             assert quintal.distance(Point(x, y)) < 1e-6
 
 
-def test_parque_e_mata_tem_espacamentos_diferentes():
-    md = MapData(bbox=BBOX)
-    quadrado = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
-    md.forests.append(
-        Forest(osm_id=-1, kind=FeatureKind.FOREST, tags={}, geometry=quadrado)
-    )
-    md.parks.append(Park(osm_id=-2, kind=FeatureKind.PARK, tags={}, geometry=quadrado))
-
-    # Mata e mais densa que parque, entao pesa mais no orcamento.
+def test_mata_pesa_mais_que_parque_no_orcamento():
+    # Mata e mais densa que parque, entao a mesma area pede mais arvore.
     assert SPACING["forest"] < SPACING["park"]
-    assert _spacing_for_budget(md, 12.0, 1) > 1.0
+    mata = _spacing_for_budget([("forest", 100_000.0)], 0, 12.0, 100)
+    parque = _spacing_for_budget([("park", 100_000.0)], 0, 12.0, 100)
+    assert mata > parque > 1.0
+
+
+def test_dossel_troca_o_miolo_da_mata_por_uma_superficie():
+    """Mata grande: o miolo vira dossel, so a faixa da borda recebe arvore."""
+    lado = 300.0
+    mata = Polygon([(0, 0), (lado, 0), (lado, lado), (0, lado)])
+    miolo, faixa = _split_shell(mata, SHELL_BORDER_M)
+
+    assert miolo is not None
+    assert miolo.area > 0.6 * mata.area  # o miolo e a maior parte
+    assert abs(miolo.area + faixa.area - mata.area) < 1.0
+
+
+def test_quintal_nao_tem_miolo():
+    quintal = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    miolo, faixa = _split_shell(quintal, SHELL_BORDER_M)
+
+    assert miolo is None
+    assert faixa.equals(quintal)
+
+
+class _CtxDossel:
+    """Contexto minimo: so o que `_canopy_surface` consulta."""
+
+    class _Palette:
+        def canopy_count(self):
+            return 2
+
+        def canopy(self, i):
+            from mapforge.core.mesh import Material
+
+            return Material(name=f"copa{i}", color=(0.2, 0.5, 0.2))
+
+    draped = False
+    terrain = None
+    palette = _Palette()
+
+
+def test_dossel_custa_muito_menos_que_arvore_individual():
+    from mapforge.core.mesh import MeshBuilder
+    from mapforge.generation.vegetation import SHELL_CELL_M, _canopy_surface
+
+    miolo = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)])  # 4 ha
+    builder = MeshBuilder()
+    faces = _canopy_surface(
+        builder, _CtxDossel, miolo, np.random.default_rng(2), _CtxDossel.palette
+    )
+
+    # ~2 triangulos por celula, mais a saia.
+    celulas = (200 / SHELL_CELL_M) ** 2
+    assert faces > celulas  # cobriu a area
+    assert faces < 4 * celulas  # sem explodir
+
+    # A mesma area com arvore a cada 12,5 m custaria muito mais.
+    arvores = (200 / 12.5) ** 2 * 0.72
+    assert faces < arvores * 33  # 33 = triangulos do prototipo barato
+
+
+def test_dossel_ondula_em_vez_de_ser_um_plano():
+    from mapforge.core.mesh import MeshBuilder
+    from mapforge.generation.vegetation import SHELL_RELIEF, _canopy_surface
+
+    miolo = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)])
+    builder = MeshBuilder()
+    _canopy_surface(builder, _CtxDossel, miolo, np.random.default_rng(5), _CtxDossel.palette)
+
+    grupos = builder.build()
+    alturas = np.concatenate([g.vertices[:, 2] for g in grupos.values()])
+    # A ondulacao tem de aparecer, sem virar montanha.
+    assert alturas.std() > 0.5
+    assert alturas.max() - alturas.min() < 4 * SHELL_RELIEF + 12.0

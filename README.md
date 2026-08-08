@@ -130,6 +130,7 @@ Fontes de edifícios:
 --footprints              # reserva: contornos abertos da Microsoft
 --detect-buildings        # detecta telhados na imagem (exige --satellite)
 --detect-vegetation       # detecta mata e gramado na imagem (exige --satellite)
+--no-canopy-shell         # arvore individual tambem no miolo da mata (pesado)
 --shadow-heights          # estima altura pela sombra na imagem (exige --satellite)
 ```
 
@@ -345,6 +346,41 @@ mata pelada, então em vez de cortar árvores no fim, o espaçamento cresce no c
 até a conta fechar — e a copa cresce junto, para o dossel continuar fechando. Uma
 mata rala de árvores grandes lê como mata; meia mata cheia e meia mata vazia não lê
 como nada.
+
+#### O que custa caro é modelar árvore que ninguém vê
+
+Uma árvore detalhada custa 96 triângulos. Com a detecção ligada, Araioses pediu 6.479
+árvores e **a vegetação virou metade da malha inteira** — desperdício, porque o miolo
+de uma mata fechada nunca é visto como árvore individual. De qualquer ângulo se vê
+duas coisas: o topo do dossel e a silhueta da borda.
+
+Duas mudanças, medidas em Araioses (1,4 km, com relevo e satélite):
+
+| | árvores | triângulos | arquivo |
+|---|---|---|---|
+| árvore individual em toda parte | 6.479 | 987k | 24,6 MB |
+| + modelo barato dentro da mata | 6.597 | 638k | 18,2 MB |
+| + dossel no miolo | **3.794** | **577k** | **18,4 MB** |
+
+**Detalhe por contexto.** Árvore de rua e de parque é vista de perto e mantém a copa
+cheia; árvore dentro de mata aparece como uma mancha no meio de outras mil e resolve
+com a copa de 20 faces (33 triângulos com o tronco). Só isso corta 35% da malha, sem
+diferença perceptível de cima. É o mesmo princípio do dossel, levado ao indivíduo.
+
+**Dossel.** Mancha de mata acima de 2.500 m² é separada em miolo e faixa de borda de
+13 m. A borda continua recebendo árvore, para a silhueta e a transição para o chão
+lerem certo. O miolo vira **uma superfície ondulada única** na altura das copas, a 2
+triângulos por célula de 8 m, com uma saia fechando a lateral até o chão. A ondulação
+é a soma de duas senoides com fase sorteada — não é ruído de verdade, mas duas
+frequências já quebram qualquer alinhamento visível de cima.
+
+O dossel troca 60 mil triângulos por praticamente o mesmo tamanho de arquivo (ele não
+é instanciado, então cada célula custa vértice próprio). O ganho real dele é outro:
+**fecha a copa**, que com árvore solta a 12,5 m ficava esburacada, e sustenta a
+escala — numa região de vários km² de mata, o orçamento de árvores rarefaria a
+floresta até sumir, enquanto o dossel custa o mesmo por hectare sempre.
+
+Desligue com `--no-canopy-shell` para ter árvore individual em toda parte.
 
 ### Coerência de porte: o perfil urbano
 
@@ -865,6 +901,9 @@ exportação com reimportação.
   caso.
 - A vegetação detectada não distingue espécie nem mede altura de copa: a espécie sai
   do perfil regional por latitude e a altura é sorteada na faixa da espécie.
+- O dossel é uma superfície, não árvores: visto de perto e de baixo ele denuncia que
+  é uma casca. Ele existe para a vista de cima e média distância, que é para o que
+  este gerador serve. Use `--no-canopy-shell` se a câmera vai entrar na mata.
 - A primeira consulta ao Overture numa região leva de 20 s a 2 min, dependendo da
   latência do S3. Só a primeira: depois é cache.
 - A detecção por imagem devolve retângulos orientados, não contornos exatos, e não

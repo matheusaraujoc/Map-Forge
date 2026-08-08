@@ -92,6 +92,7 @@ def _settings_from_args(args) -> GenerationSettings:
         shadow_heights=args.shadow_heights,
         detect_buildings=args.detect_buildings,
         detect_vegetation=args.detect_vegetation,
+        canopy_shell=not args.no_canopy_shell,
         urban_scale=args.urban_scale,
     )
 
@@ -475,6 +476,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="sem janelas nas fachadas (reduz muito o tamanho do arquivo)",
     )
     gen.add_argument(
+        "--no-canopy-shell",
+        action="store_true",
+        dest="no_canopy_shell",
+        help="arvore individual tambem no miolo das matas, em vez do dossel "
+        "(mais bonito de perto, bem mais pesado)",
+    )
+    gen.add_argument(
         "--preview", nargs="?", const=True, default=False, help="tambem grava a planta 2D em PNG"
     )
     gen.add_argument(
@@ -622,6 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
     region.add_argument("--footprints", action="store_true")
     region.add_argument("--detect-buildings", action="store_true", dest="detect_buildings")
     region.add_argument("--detect-vegetation", action="store_true", dest="detect_vegetation")
+    region.add_argument("--no-canopy-shell", action="store_true", dest="no_canopy_shell")
     region.add_argument(
         "--urban-scale", dest="urban_scale", default=None,
         choices=("povoado", "pequena", "media", "grande"),

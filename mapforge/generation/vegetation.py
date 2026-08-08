@@ -7,6 +7,7 @@ com posicao, escala e rotacao proprias.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 from shapely import contains_xy
@@ -182,6 +183,14 @@ class TreePrototypes:
         return self.canopies.get(species, self.canopies["broadleaf"])
 
 
+# Detalhe por contexto, que e o mesmo principio do dossel levado ao individuo:
+# a arvore de rua e vista de perto e merece a copa cheia (96 triangulos); a
+# arvore de dentro de uma mata aparece como uma mancha no meio de outras mil e
+# resolve com a copa de 20 faces. Trocar so isso corta dois tercos do custo da
+# vegetacao em massa, sem diferenca perceptivel de cima.
+MASS_CONTEXTS = {"forest"}
+
+
 def _scatter(poly: Polygon, spacing: float, rng: np.random.Generator) -> np.ndarray:
     """Distribui pontos dentro do poligono. Retorna array (n, 2).
 
@@ -265,9 +274,240 @@ def _as_polygons(geom):
 # Fracao de pontos que sobrevive ao jitter e a rejeicao dentro de `_scatter`.
 SCATTER_YIELD = 0.72
 
+# --- dossel ---
+#
+# Uma arvore custa 96 triangulos. Uma mata de 13 ha pedia 5.000 arvores so para
+# ela, e a vegetacao passou a ser metade da malha inteira - o que e desperdicio,
+# porque o miolo de uma mata fechada nunca e visto como arvore individual. De
+# qualquer angulo se ve duas coisas: o topo do dossel e a silhueta da borda.
+#
+# Entao o miolo vira uma superficie unica e ondulada na altura das copas (2
+# triangulos por celula), e so a faixa da borda recebe arvore de verdade. Em
+# Araioses isso troca ~500 mil triangulos por ~200 mil, e ainda fecha o dossel,
+# que com arvore solta ficava esburacado.
 
-def _spacing_for_budget(map_data, base_spacing: float, max_trees: int) -> float:
+# Area a partir da qual vale a pena separar miolo de borda.
+SHELL_MIN_AREA = 2_500.0
+# Largura da faixa de borda que continua recebendo arvore individual.
+SHELL_BORDER_M = 13.0
+# Lado da celula do dossel. Menor ondula mais fino e custa mais - e como o
+# dossel nao e instanciado, cada celula custa vertice proprio no arquivo. 8 m
+# sustenta as duas frequencias da ondulacao sem serrilhar.
+SHELL_CELL_M = 8.0
+# Altura media do dossel e amplitude da ondulacao, em metros.
+SHELL_HEIGHT = 11.0
+SHELL_RELIEF = 2.6
+
+
+def _split_shell(poly: Polygon, band: float):
+    """Separa o miolo (vira dossel) da faixa de borda (recebe arvore).
+
+    Devolve (miolo, faixa). Miolo None quando a mancha e estreita demais para
+    ter miolo - quintal e capao fino sao so borda, e continuam com arvore.
+    """
+    if poly.area < SHELL_MIN_AREA:
+        return None, poly
+    try:
+        miolo = poly.buffer(-band)
+    except Exception:  # noqa: BLE001 - topologia ruim
+        return None, poly
+    if miolo.is_empty or miolo.area < SHELL_MIN_AREA * 0.35:
+        return None, poly
+    try:
+        faixa = poly.difference(miolo)
+    except Exception:  # noqa: BLE001
+        return None, poly
+    return miolo, faixa
+
+
+def _canopy_surface(
+    builder: MeshBuilder,
+    ctx: GenerationContext,
+    geom,
+    rng: np.random.Generator,
+    palette,
+) -> int:
+    """Constroi o dossel sobre o miolo de uma mata. Retorna os triangulos.
+
+    A ondulacao vem da soma de duas senoides com fase sorteada. Nao e ruido de
+    verdade, mas basta: o que se quer e que o topo nao seja um plano, e duas
+    frequencias ja quebram qualquer alinhamento visivel de cima.
+    """
+    minx, miny, maxx, maxy = geom.bounds
+    passo = SHELL_CELL_M
+    xs = np.arange(minx, maxx + passo, passo)
+    ys = np.arange(miny, maxy + passo, passo)
+    if len(xs) < 2 or len(ys) < 2:
+        return 0
+
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    plano_x, plano_y = grid_x.ravel(), grid_y.ravel()
+
+    dentro = contains_xy(geom, plano_x, plano_y).reshape(grid_y.shape)
+    if not dentro.any():
+        return 0
+
+    # Altura: chao + copa ondulada.
+    chao = np.zeros(plano_x.shape)
+    if ctx.draped:
+        chao = ctx.terrain.height(plano_x, plano_y)
+
+    fase = rng.uniform(0.0, 2 * np.pi, size=4)
+    onda = (
+        np.sin(plano_x / 27.0 + fase[0]) * np.cos(plano_y / 31.0 + fase[1])
+        + 0.55 * np.sin(plano_x / 13.0 + fase[2]) * np.sin(plano_y / 11.0 + fase[3])
+    )
+    topo = chao + layers.Z_GREEN + SHELL_HEIGHT + onda * SHELL_RELIEF
+
+    verts = np.column_stack([plano_x, plano_y, topo])
+    largura = len(xs)
+
+    # Uma celula so vira quadrado quando os quatro cantos estao dentro; assim a
+    # borda do dossel acompanha o contorno em vez de estourar para fora.
+    linhas, colunas = np.nonzero(
+        dentro[:-1, :-1] & dentro[1:, :-1] & dentro[:-1, 1:] & dentro[1:, 1:]
+    )
+    if not len(linhas):
+        return 0
+
+    canto = linhas * largura + colunas
+    faces = np.concatenate(
+        [
+            np.column_stack([canto, canto + 1, canto + largura + 1]),
+            np.column_stack([canto, canto + largura + 1, canto + largura]),
+        ]
+    )
+
+    # Divide em duas tonalidades para o dossel nao virar uma chapa de cor unica.
+    n_cores = max(palette.canopy_count(), 1)
+    tom = (
+        (np.sin(plano_x[canto] / 34.0) + np.cos(plano_y[canto] / 29.0) + 2.0)
+        / 4.0
+        * n_cores
+    ).astype(np.int64) % n_cores
+
+    total = 0
+    for i in range(n_cores):
+        parte = faces[np.tile(tom == i, 2)]
+        if len(parte):
+            builder.add_mesh(palette.canopy(i), verts, parte)
+            total += len(parte)
+
+    # Saia: fecha a lateral ate o chao, senao o dossel flutua onde a faixa de
+    # borda nao cobre.
+    total += _canopy_skirt(builder, ctx, geom, verts, dentro, largura, palette)
+    return total
+
+
+def _canopy_skirt(builder, ctx, geom, verts, dentro, largura, palette) -> int:
+    """Parede vertical da borda do dossel ate o chao."""
+    contornos = [geom.exterior] if isinstance(geom, Polygon) else []
+    for parte in getattr(geom, "geoms", []):
+        if isinstance(parte, Polygon):
+            contornos.append(parte.exterior)
+    if not contornos:
+        return 0
+
+    material = palette.canopy(0)
+    total = 0
+    for anel in contornos:
+        pontos = np.asarray(anel.coords, dtype=np.float64)
+        if len(pontos) < 3:
+            continue
+        chao = np.zeros(len(pontos))
+        if ctx.draped:
+            chao = ctx.terrain.height(pontos[:, 0], pontos[:, 1])
+        # A altura da saia acompanha a media do dossel, sem a ondulacao.
+        topo = chao + layers.Z_GREEN + SHELL_HEIGHT * 0.72
+
+        n = len(pontos)
+        baixo = np.column_stack([pontos, chao + layers.Z_GREEN])
+        alto = np.column_stack([pontos, topo])
+        vertices = np.concatenate([baixo, alto])
+
+        i = np.arange(n - 1)
+        faces = np.concatenate(
+            [
+                np.column_stack([i, i + 1, i + 1 + n]),
+                np.column_stack([i, i + 1 + n, i + n]),
+            ]
+        )
+        builder.add_mesh(material, vertices, faces)
+        total += len(faces)
+    return total
+
+
+@dataclass
+class _GreenArea:
+    """Uma area verde ja resolvida: o que vira dossel e o que recebe arvore."""
+
+    kind: str
+    osm_id: int
+    scatter: object  # geometria que recebe arvore (pode ser vazia)
+    shell: object = None  # miolo que vira dossel, ou None
+    scatter_area: float = 0.0
+
+
+def _plan_areas(ctx, map_data, base_spacing: float, exclude) -> list[_GreenArea]:
+    """Resolve, para cada area verde, o que e dossel e o que e arvore."""
+    usa_dossel = getattr(ctx.settings, "canopy_shell", True)
+    plano: list[_GreenArea] = []
+
+    for kind, features in (("forest", map_data.forests), ("park", map_data.parks)):
+        for feature in features:
+            geom = feature.geometry
+            if geom is None or geom.is_empty or geom.area < MIN_PATCH_M2:
+                continue
+            if feature.tags.get("leisure") in {"pitch", "playground", "golf_course"}:
+                continue  # campos e quadras ficam gramados
+
+            # A mancha vinda da imagem ja nasce recortada contra telhado, via e
+            # agua - foi assim que ela foi encontrada. Recortar de novo, agora
+            # com a folga de 1,5 m do `exclude`, corroia a borda de cada quintal
+            # e apagava a arvore que existe de verdade colada na casa.
+            if exclude is not None and feature.tags.get("source") != "deteccao":
+                try:
+                    geom = geom.difference(exclude)
+                except Exception:  # noqa: BLE001 - segue com a area original
+                    pass
+            if geom.is_empty:
+                continue
+
+            # So mata tem dossel: parque e gramado com arvore solta, nao copa
+            # fechada, e cobri-lo com uma superficie apagaria o gramado.
+            miolo = None
+            espalhar = geom
+            if usa_dossel and kind == "forest":
+                partes_miolo, partes_faixa = [], []
+                for poly in _as_polygons(geom):
+                    dentro, faixa = _split_shell(poly, SHELL_BORDER_M)
+                    if dentro is not None:
+                        partes_miolo.append(dentro)
+                    if faixa is not None and not faixa.is_empty:
+                        partes_faixa.append(faixa)
+                if partes_miolo:
+                    miolo = unary_union(partes_miolo)
+                    espalhar = unary_union(partes_faixa) if partes_faixa else None
+
+            plano.append(
+                _GreenArea(
+                    kind=kind,
+                    osm_id=feature.osm_id,
+                    scatter=espalhar,
+                    shell=miolo,
+                    scatter_area=(
+                        espalhar.area if espalhar is not None and not espalhar.is_empty else 0.0
+                    ),
+                )
+            )
+    return plano
+
+
+def _spacing_for_budget(areas_por_tipo, arvores_mapeadas, base_spacing, max_trees) -> float:
     """Fator a aplicar no espacamento para o total caber no orcamento.
+
+    `areas_por_tipo` e uma sequencia de (kind, area em m2) - ja so a area que
+    vai receber arvore, sem o miolo que virou dossel.
 
     Devolve 1.0 quando ja cabe. Como a contagem cai com o quadrado do
     espacamento, o fator e a raiz da razao entre o estimado e o teto.
@@ -276,15 +516,11 @@ def _spacing_for_budget(map_data, base_spacing: float, max_trees: int) -> float:
         return 1.0
 
     estimado = 0.0
-    for kind, features in (("forest", map_data.forests), ("park", map_data.parks)):
+    for kind, area in areas_por_tipo:
         passo = base_spacing * SPACING[kind]
-        if passo <= 0:
-            continue
-        area = sum(
-            f.geometry.area for f in features if f.geometry is not None and not f.geometry.is_empty
-        )
-        estimado += area / (passo * passo) * SCATTER_YIELD
-    estimado += len(map_data.trees)
+        if passo > 0:
+            estimado += area / (passo * passo) * SCATTER_YIELD
+    estimado += arvores_mapeadas
 
     if estimado <= max_trees:
         return 1.0
@@ -305,27 +541,43 @@ def generate_vegetation(
     density = max(settings.tree_density, 0.05)
     base_spacing = ctx.detail["tree_spacing"] / density
 
+    # --- plano ---
+    #
+    # Decide antes o que vira dossel e o que vira arvore, porque o orcamento
+    # precisa contar so a area que de fato recebe arvore.
+    plano = _plan_areas(ctx, map_data, base_spacing, exclude)
+
     # --- orcamento ---
     #
-    # Com a vegetacao vindo da imagem, uma regiao de mata pode pedir dezenas de
-    # milhares de arvores. Truncar a lista no teto deixaria metade da mata pelada,
-    # entao em vez de cortar arvores no fim, afastamos todas no comeco: o
-    # espacamento cresce ate a conta fechar, e a copa cresce junto para o dossel
-    # continuar fechando. Uma mata rala de arvores grandes le como mata; meia
-    # mata cheia e meia mata vazia nao le como nada.
-    orcamento = _spacing_for_budget(map_data, base_spacing, settings.max_trees)
+    # Mesmo com o dossel, uma regiao de mata pode pedir dezenas de milhares de
+    # arvores. Truncar a lista no teto deixaria metade da mata pelada, entao em
+    # vez de cortar arvores no fim, afastamos todas no comeco: o espacamento
+    # cresce ate a conta fechar, e a copa cresce junto para o dossel continuar
+    # fechando. Uma mata rala de arvores grandes le como mata; meia mata cheia e
+    # meia mata vazia nao le como nada.
+    orcamento = _spacing_for_budget(
+        [(item.kind, item.scatter_area) for item in plano],
+        len(map_data.trees),
+        base_spacing,
+        settings.max_trees,
+    )
     base_spacing *= orcamento
     crown_scale = min(orcamento, 1.45)
     if orcamento > 1.02:
         log.info(
             "Vegetacao: espacamento x%.2f para caber em %d arvores", orcamento, settings.max_trees
         )
-    prototypes = TreePrototypes(settings.detail)
+    # Dois conjuntos de modelo: o do nivel de detalhe pedido para arvore vista de
+    # perto, e o barato para vegetacao em massa dentro de mata.
+    prototypes = {
+        "detalhe": TreePrototypes(settings.detail),
+        "massa": TreePrototypes("low"),
+    }
     palette = ctx.palette
     n_canopies = palette.canopy_count()
 
-    # (posicao x, y, z, escala, rotacao) por especie
-    placements: dict[str, list[np.ndarray]] = {name: [] for name in SPECIES_HEIGHT}
+    # (posicao x, y, z, escala, rotacao) por (grupo de detalhe, especie)
+    placements: dict[tuple[str, str], list[np.ndarray]] = {}
 
     def place(points: np.ndarray, rng: np.random.Generator, context: str):
         """Sorteia especie por ponto e guarda a transformacao de cada arvore."""
@@ -346,13 +598,14 @@ def generate_vegetation(
             ground = ground + ctx.terrain.height(points[:, 0], points[:, 1])
 
         scale = CONTEXT_SCALE[context] * (crown_scale if context != "street" else 1.0)
+        grupo = "massa" if context in MASS_CONTEXTS else "detalhe"
         for index, name in enumerate(names):
             mask = chosen == index
             if not mask.any():
                 continue
             low, high = SPECIES_HEIGHT[name]
             heights = rng.uniform(low * scale, high * scale, size=int(mask.sum()))
-            placements[name].append(
+            placements.setdefault((grupo, name), []).append(
                 np.column_stack(
                     [
                         points[mask, 0],
@@ -365,41 +618,30 @@ def generate_vegetation(
             )
 
     # --- areas verdes ---
-    for kind, features in (("forest", map_data.forests), ("park", map_data.parks)):
-        spacing = base_spacing * SPACING[kind]
-        for feature in features:
-            geom = feature.geometry
-            if geom is None or geom.is_empty or geom.area < MIN_PATCH_M2:
-                continue
-            # A mancha vinda da imagem ja nasce recortada contra telhado, via e
-            # agua - foi assim que ela foi encontrada. Recortar de novo, agora
-            # com a folga de 1,5 m do `exclude`, corroia a borda de cada quintal
-            # e apagava a arvore que existe de verdade colada na casa.
-            detectada = feature.tags.get("source") == "deteccao"
-            if exclude is not None and not detectada:
-                try:
-                    geom = geom.difference(exclude)
-                except Exception:  # noqa: BLE001 - segue com a area original
-                    pass
-            leisure = feature.tags.get("leisure")
-            if leisure in {"pitch", "playground", "golf_course"}:
-                continue  # campos e quadras ficam gramados
+    shell_faces = 0
+    for item in plano:
+        spacing = base_spacing * SPACING[item.kind]
+        rng = ctx.rng(item.osm_id, int(item.scatter_area) + 1)
 
-            rng = ctx.rng(feature.osm_id, int(geom.area))
-            for poly in _as_polygons(geom):
-                # O piso e o tamanho de uma copa, nao o do espacamento. Descartar
-                # tudo que for menor que o espacamento apagava justamente a
-                # arvore de quintal - que e a maioria da vegetacao de uma cidade
-                # pequena, e que sai fatiada em cacos ao recortar contra as casas.
-                if poly.area < MIN_PATCH_M2:
-                    continue
-                points = _scatter(poly, spacing, rng)
-                if len(points) and ctx.imagery is not None:
-                    # A foto decide onde ha copa de verdade: campo de futebol e
-                    # patio dentro do parque deixam de receber arvore.
-                    verde = _greenness(ctx.imagery, points)
-                    points = points[rng.random(len(points)) < verde]
-                place(points, rng, context=kind)
+        if item.shell is not None and not item.shell.is_empty:
+            shell_faces += _canopy_surface(builder, ctx, item.shell, rng, palette)
+
+        if item.scatter is None or item.scatter.is_empty:
+            continue
+        for poly in _as_polygons(item.scatter):
+            # O piso e o tamanho de uma copa, nao o do espacamento. Descartar
+            # tudo que for menor que o espacamento apagava justamente a arvore
+            # de quintal - que e a maioria da vegetacao de uma cidade pequena, e
+            # que sai fatiada em cacos ao recortar contra as casas.
+            if poly.area < MIN_PATCH_M2:
+                continue
+            points = _scatter(poly, spacing, rng)
+            if len(points) and ctx.imagery is not None:
+                # A foto decide onde ha copa de verdade: campo de futebol e
+                # patio dentro do parque deixam de receber arvore.
+                verde = _greenness(ctx.imagery, points)
+                points = points[rng.random(len(points)) < verde]
+            place(points, rng, context=item.kind)
 
     # --- arvores mapeadas individualmente (quase sempre arborizacao de rua) ---
     if map_data.trees:
@@ -413,7 +655,7 @@ def generate_vegetation(
             place(points, rng, context="street")
 
     total = 0
-    for species, chunks in placements.items():
+    for (grupo, species), chunks in placements.items():
         chunks = [c for c in chunks if len(c)]
         if not chunks:
             continue
@@ -424,15 +666,22 @@ def generate_vegetation(
             continue
         total += len(rows)
 
-        builder.add_instances(palette.trunk, prototypes.trunk(species), rows)
+        modelos = prototypes[grupo]
+        builder.add_instances(palette.trunk, modelos.trunk(species), rows)
         # Divide as copas entre as cores da paleta para quebrar a repeticao.
         offset = abs(hash(species)) % max(n_canopies, 1)
         canopy_index = (np.arange(len(rows)) + offset) % n_canopies
-        proto = prototypes.canopy(species)
+        proto = modelos.canopy(species)
         for i in range(n_canopies):
             subset = rows[canopy_index == i]
             if len(subset):
                 builder.add_instances(palette.canopy(i), proto, subset)
 
-    ctx.report(f"{total} arvores", 1.0)
+    if shell_faces:
+        # O dossel nao conta como arvore, mas conta muito no arquivo: sem ele
+        # essas mesmas manchas custariam alguns milhares de instancias.
+        log.info("Dossel: %d triangulos cobrindo o miolo das matas", shell_faces)
+        ctx.report(f"{total} arvores + dossel ({shell_faces // 1000}k triangulos)", 1.0)
+    else:
+        ctx.report(f"{total} arvores", 1.0)
     return total

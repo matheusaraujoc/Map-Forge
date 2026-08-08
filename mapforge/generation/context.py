@@ -110,6 +110,10 @@ class GenerationSettings:
     # sinal e confiavel e nao ha fonte pronta equivalente: o OSM quase nunca
     # desenha mata em cidade pequena. Exige satellite=True.
     detect_vegetation: bool = False
+    # O miolo das matas grandes vira uma superficie ondulada unica em vez de
+    # milhares de arvores. Desligue para ter arvore individual em toda parte -
+    # fica mais bonito de perto e muito mais pesado.
+    canopy_shell: bool = True
 
     # --- relevo ---
     elevation: bool = False
