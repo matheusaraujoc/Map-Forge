@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.vscode
+
+# Cache de downloads e banco local
+data/
+
+# Malhas e imagens geradas
+output/
+*.glb
+*.gltf
+*.obj
+*.mtl
+*.ply
+
+# Arquivos de planejamento
+planejamento_procedural.md
+planejamento.md
+Melhorias.md

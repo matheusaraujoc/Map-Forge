@@ -1,0 +1,18 @@
+# Nucleo do MapForge
+numpy>=1.24
+requests>=2.31
+shapely>=2.0
+trimesh>=4.0
+mapbox-earcut>=1.0
+
+# Preview 2D
+matplotlib>=3.7
+
+# Imagem de satelite (mosaico de tiles e texturas)
+pillow>=10.0
+
+# Interface grafica (o mapa de selecao usa QtWebEngine, que vem no PySide6-Addons)
+PySide6>=6.5
+
+# Viewport 3D navegavel dentro da janela
+moderngl>=5.8

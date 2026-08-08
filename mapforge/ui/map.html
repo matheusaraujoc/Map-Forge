@@ -1,0 +1,283 @@
+<meta charset="utf-8">
+<title>Selecao de regiao</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+               font: 13px/1.4 "Segoe UI", system-ui, sans-serif; background: #dfe3e6; }
+  #map { position: absolute; inset: 0; cursor: grab; overflow: hidden; }
+  #map.panning { cursor: grabbing; }
+  #map.selecting { cursor: crosshair; }
+  #tiles { position: absolute; transform-origin: 0 0; }
+  #tiles img { position: absolute; width: 256px; height: 256px; user-select: none;
+               -webkit-user-drag: none; }
+  #box { position: absolute; border: 2px solid #ff5a36; background: rgba(255,90,54,.16);
+         pointer-events: none; display: none; }
+  #box::after { content: attr(data-size); position: absolute; left: 0; bottom: 100%;
+                background: #ff5a36; color: #fff; padding: 2px 6px; font-size: 11px;
+                white-space: nowrap; border-radius: 3px 3px 0 0; }
+  .panel { position: absolute; z-index: 5; background: rgba(255,255,255,.94); color: #1a1a1a;
+           border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,.25); }
+  #top { top: 10px; left: 10px; right: 10px; padding: 8px; display: flex; gap: 8px;
+         align-items: center; flex-wrap: wrap; }
+  #search { flex: 1 1 220px; min-width: 160px; padding: 6px 9px; border: 1px solid #bbb;
+            border-radius: 5px; font: inherit; }
+  button { padding: 6px 11px; border: 1px solid #bbb; border-radius: 5px; background: #fff;
+           font: inherit; cursor: pointer; }
+  button:hover { background: #f0f0f0; }
+  button.active { background: #ff5a36; border-color: #ff5a36; color: #fff; }
+  #status { position: absolute; bottom: 10px; left: 10px; padding: 6px 10px; font-size: 12px; }
+  #credit { position: absolute; bottom: 10px; right: 10px; padding: 4px 8px; font-size: 10px;
+            color: #333; }
+  .zoombtns { position: absolute; top: 62px; left: 10px; display: flex; flex-direction: column; }
+  .zoombtns button { width: 32px; height: 32px; padding: 0; font-size: 17px; }
+</style>
+
+<div id="map">
+  <div id="tiles"></div>
+  <div id="box"></div>
+</div>
+
+<div class="panel" id="top">
+  <input id="search" placeholder="Buscar lugar (ex: Ouro Preto, MG) e pressionar Enter">
+  <button id="btn-select">Selecionar area</button>
+  <button id="btn-layer">Satelite</button>
+  <button id="btn-clear">Limpar</button>
+</div>
+
+<div class="zoombtns panel">
+  <button id="btn-in">+</button>
+  <button id="btn-out">&minus;</button>
+</div>
+
+<div class="panel" id="status">Arraste para mover. Clique em <b>Selecionar area</b> e arraste para marcar a regiao.</div>
+<div class="panel" id="credit">&copy; OpenStreetMap contributors</div>
+
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>
+const TILE = 256;
+const LAYERS = {
+  osm: { url: (z,x,y) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png`,
+         max: 19, credit: '&copy; OpenStreetMap contributors' },
+  sat: { url: (z,x,y) => `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`,
+         max: 19, credit: 'Esri, Maxar, Earthstar Geographics' },
+};
+
+const view = { lat: -20.3857, lon: -43.5036, zoom: 15, layer: 'osm' };
+let bridge = null, selecting = false, selection = null;
+
+const el = {
+  map: document.getElementById('map'),
+  tiles: document.getElementById('tiles'),
+  box: document.getElementById('box'),
+  status: document.getElementById('status'),
+  credit: document.getElementById('credit'),
+};
+
+/* --- Web Mercator: graus <-> pixel global no zoom atual --- */
+function lonToX(lon, z) { return (lon + 180) / 360 * TILE * 2 ** z; }
+function latToY(lat, z) {
+  const s = Math.sin(lat * Math.PI / 180);
+  return (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * TILE * 2 ** z;
+}
+function xToLon(x, z) { return x / (TILE * 2 ** z) * 360 - 180; }
+function yToLat(y, z) {
+  const n = Math.PI - 2 * Math.PI * y / (TILE * 2 ** z);
+  return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+function centerPixel() { return { x: lonToX(view.lon, view.zoom), y: latToY(view.lat, view.zoom) }; }
+function screenToLatLon(px, py) {
+  const c = centerPixel();
+  const x = c.x + px - el.map.clientWidth / 2;
+  const y = c.y + py - el.map.clientHeight / 2;
+  return { lat: yToLat(y, view.zoom), lon: xToLon(x, view.zoom) };
+}
+function latLonToScreen(lat, lon) {
+  const c = centerPixel();
+  return {
+    x: lonToX(lon, view.zoom) - c.x + el.map.clientWidth / 2,
+    y: latToY(lat, view.zoom) - c.y + el.map.clientHeight / 2,
+  };
+}
+
+function render() {
+  const layer = LAYERS[view.layer];
+  const w = el.map.clientWidth, h = el.map.clientHeight;
+  // Antes de o layout assentar o elemento tem tamanho zero; renderizar nesse
+  // instante pede uma faixa de tiles sem sentido.
+  if (w < 2 || h < 2) { requestAnimationFrame(render); return; }
+  const c = centerPixel();
+  const left = c.x - w / 2, top = c.y - h / 2;
+  const x0 = Math.floor(left / TILE), x1 = Math.floor((left + w) / TILE);
+  const y0 = Math.floor(top / TILE), y1 = Math.floor((top + h) / TILE);
+  const n = 2 ** view.zoom;
+
+  const wanted = new Set();
+  const frag = document.createDocumentFragment();
+  for (let x = x0; x <= x1; x++) {
+    for (let y = y0; y <= y1; y++) {
+      if (y < 0 || y >= n) continue;
+      const wx = ((x % n) + n) % n;
+      const key = `${view.layer}/${view.zoom}/${wx}/${y}`;
+      wanted.add(key);
+      if (el.tiles.querySelector(`[data-key="${CSS.escape(key)}"]`)) continue;
+      const img = new Image();
+      img.dataset.key = key;
+      img.src = layer.url(view.zoom, wx, y);
+      img.style.left = (x * TILE - left) + 'px';
+      img.style.top = (y * TILE - top) + 'px';
+      img.onerror = () => img.remove();
+      frag.appendChild(img);
+    }
+  }
+  // Reposiciona os que ficaram e remove os que sairam do campo.
+  el.tiles.querySelectorAll('img').forEach(img => {
+    if (!wanted.has(img.dataset.key)) { img.remove(); return; }
+    const [, z, x, y] = img.dataset.key.split('/').map(Number);
+    img.style.left = (x * TILE - left) + 'px';
+    img.style.top = (y * TILE - top) + 'px';
+  });
+  el.tiles.appendChild(frag);
+  el.credit.innerHTML = layer.credit;
+  drawBox();
+}
+
+function drawBox() {
+  if (!selection) { el.box.style.display = 'none'; return; }
+  const a = latLonToScreen(selection.north, selection.west);
+  const b = latLonToScreen(selection.south, selection.east);
+  el.box.style.display = 'block';
+  el.box.style.left = Math.min(a.x, b.x) + 'px';
+  el.box.style.top = Math.min(a.y, b.y) + 'px';
+  el.box.style.width = Math.abs(b.x - a.x) + 'px';
+  el.box.style.height = Math.abs(b.y - a.y) + 'px';
+
+  const mid = (selection.north + selection.south) / 2;
+  const wm = (selection.east - selection.west) * 111320 * Math.cos(mid * Math.PI / 180);
+  const hm = (selection.north - selection.south) * 110540;
+  el.box.dataset.size = `${Math.round(wm)} x ${Math.round(hm)} m  (${(wm * hm / 1e6).toFixed(2)} km2)`;
+}
+
+function commitSelection() {
+  drawBox();
+  if (bridge && selection) {
+    bridge.setSelection(selection.south, selection.west, selection.north, selection.east);
+  }
+}
+
+/* --- interacao --- */
+let drag = null;
+el.map.addEventListener('mousedown', e => {
+  const rect = el.map.getBoundingClientRect();
+  drag = { x: e.clientX, y: e.clientY, px: e.clientX - rect.left, py: e.clientY - rect.top,
+           mode: (selecting || e.shiftKey) ? 'select' : 'pan' };
+  el.map.classList.toggle('panning', drag.mode === 'pan');
+  e.preventDefault();
+});
+
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  if (drag.mode === 'pan') {
+    const c = centerPixel();
+    view.lon = xToLon(c.x - (e.clientX - drag.x), view.zoom);
+    view.lat = yToLat(c.y - (e.clientY - drag.y), view.zoom);
+    drag.x = e.clientX; drag.y = e.clientY;
+    render();
+  } else {
+    const rect = el.map.getBoundingClientRect();
+    const a = screenToLatLon(drag.px, drag.py);
+    const b = screenToLatLon(e.clientX - rect.left, e.clientY - rect.top);
+    selection = {
+      south: Math.min(a.lat, b.lat), north: Math.max(a.lat, b.lat),
+      west: Math.min(a.lon, b.lon), east: Math.max(a.lon, b.lon),
+    };
+    drawBox();
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  if (drag && drag.mode === 'select' && selection) commitSelection();
+  if (drag) el.map.classList.remove('panning');
+  drag = null;
+});
+
+el.map.addEventListener('wheel', e => {
+  e.preventDefault();
+  const rect = el.map.getBoundingClientRect();
+  const before = screenToLatLon(e.clientX - rect.left, e.clientY - rect.top);
+  const max = LAYERS[view.layer].max;
+  view.zoom = Math.max(2, Math.min(max, view.zoom + (e.deltaY < 0 ? 1 : -1)));
+  const after = screenToLatLon(e.clientX - rect.left, e.clientY - rect.top);
+  // Mantem sob o cursor o mesmo ponto geografico de antes do zoom.
+  view.lat += before.lat - after.lat;
+  view.lon += before.lon - after.lon;
+  render();
+}, { passive: false });
+
+function setSelecting(on) {
+  selecting = on;
+  document.getElementById('btn-select').classList.toggle('active', on);
+  el.map.classList.toggle('selecting', on);
+  el.status.innerHTML = on
+    ? 'Arraste sobre o mapa para marcar a regiao.'
+    : 'Arraste para mover. Segure <b>Shift</b> para selecionar sem trocar de modo.';
+}
+
+document.getElementById('btn-select').onclick = () => setSelecting(!selecting);
+document.getElementById('btn-layer').onclick = () => {
+  view.layer = view.layer === 'osm' ? 'sat' : 'osm';
+  document.getElementById('btn-layer').textContent = view.layer === 'osm' ? 'Satelite' : 'Mapa';
+  document.getElementById('btn-layer').classList.toggle('active', view.layer === 'sat');
+  el.tiles.innerHTML = '';
+  render();
+};
+document.getElementById('btn-clear').onclick = () => {
+  selection = null; drawBox();
+  if (bridge) bridge.setSelection(0, 0, 0, 0);
+};
+document.getElementById('btn-in').onclick = () => {
+  view.zoom = Math.min(LAYERS[view.layer].max, view.zoom + 1); render();
+};
+document.getElementById('btn-out').onclick = () => { view.zoom = Math.max(2, view.zoom - 1); render(); };
+
+document.getElementById('search').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && bridge) {
+    el.status.textContent = 'Buscando...';
+    bridge.search(e.target.value);
+  }
+});
+
+window.addEventListener('resize', render);
+window.addEventListener('load', render);
+
+/* --- API chamada pelo Python --- */
+window.mapforge = {
+  goTo(lat, lon, zoom) {
+    view.lat = lat; view.lon = lon;
+    if (zoom) view.zoom = zoom;
+    render();
+  },
+  setSelectionBox(s, w, n, e) {
+    selection = { south: s, west: w, north: n, east: e };
+    commitSelection();
+  },
+  selectAroundCenter(radiusM) {
+    const dLat = radiusM / 110540;
+    const dLon = radiusM / (111320 * Math.cos(view.lat * Math.PI / 180));
+    selection = { south: view.lat - dLat, north: view.lat + dLat,
+                  west: view.lon - dLon, east: view.lon + dLon };
+    commitSelection();
+  },
+  setStatus(text) { el.status.innerHTML = text; },
+};
+
+new QWebChannel(qt.webChannelTransport, channel => {
+  bridge = channel.objects.bridge;
+  render();
+  bridge.ready();
+});
+
+setSelecting(false);
+render();
+</script>
