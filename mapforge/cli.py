@@ -88,6 +88,7 @@ def _settings_from_args(args) -> GenerationSettings:
         elevation_exaggeration=args.exaggeration,
         extra_footprints=args.footprints,
         shadow_heights=args.shadow_heights,
+        detect_buildings=args.detect_buildings,
     )
 
 
@@ -414,6 +415,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="completa o OSM com os contornos abertos da Microsoft "
         "(essencial em cidade pequena; primeiro download por regiao e grande)",
+    )
+    fontes.add_argument(
+        "--detect-buildings",
+        action="store_true",
+        dest="detect_buildings",
+        help="detecta telhados na propria imagem onde nao ha contorno pronto "
+        "(exige --satellite; aproximado, retangulos orientados)",
     )
     fontes.add_argument(
         "--shadow-heights",

@@ -47,7 +47,14 @@ def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
                     if b.height and 3.0 < b.height < 250.0
                 }
                 result = estimate_heights(ctx.imagery, map_data.buildings, known)
-                ctx.shadow_heights = result.heights
+                # Sem predios de referencia a escala e um chute sobre a elevacao
+                # solar; aplicar isso produz altura pior que a procedural.
+                if result.confidence == "baixa":
+                    log.warning(
+                        "Alturas por sombra descartadas: %s", result.note or "confianca baixa"
+                    )
+                else:
+                    ctx.shadow_heights = result.heights
                 stats["shadow"] = result.summary()
             except Exception as exc:  # noqa: BLE001 - altura procedural continua valendo
                 log.warning("Estimativa por sombra falhou: %s", exc)

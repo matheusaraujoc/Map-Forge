@@ -87,6 +87,9 @@ class GenerationSettings:
     # imagem de satelite. E o que enche a cidade pequena.
     extra_footprints: bool = False
     shadow_heights: bool = False  # estima altura pela sombra na imagem
+    # Ultima linha: detecta telhados na propria imagem onde nenhuma fonte de
+    # contorno cobre. Exige satellite=True.
+    detect_buildings: bool = False
 
     # --- relevo ---
     elevation: bool = False

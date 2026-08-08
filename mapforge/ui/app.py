@@ -248,6 +248,17 @@ class MainWindow(QWidget):
         )
         sources_layout.addWidget(self.extra_footprints)
 
+        self.detect_buildings = QCheckBox("Detectar telhados na imagem (aproximado)")
+        self.detect_buildings.setToolTip(
+            "Ultima linha, para onde nem o OSM nem os contornos abertos cobrem.\n"
+            "Usa o mapa 2D como filtro: onde ha rua, agua ou mata nao ha telhado,\n"
+            "e casa fica perto de rua.\n\n"
+            "Devolve retangulos orientados, nao o contorno exato. Requer a\n"
+            "imagem de satelite ligada."
+        )
+        self.detect_buildings.setEnabled(False)
+        sources_layout.addWidget(self.detect_buildings)
+
         self.shadow_heights = QCheckBox("Estimar altura pela sombra na imagem")
         self.shadow_heights.setToolTip(
             "Mede a sombra projetada e converte em altura.\n"
@@ -345,10 +356,11 @@ class MainWindow(QWidget):
     def _on_satellite_toggle(self, checked: bool) -> None:
         for widget in (self.provider, self.roof_blend, self.area_blend, self.ground_texture):
             widget.setEnabled(checked)
-        # A estimativa por sombra precisa da imagem.
-        self.shadow_heights.setEnabled(checked)
-        if not checked:
-            self.shadow_heights.setChecked(False)
+        # Deteccao e estimativa por sombra precisam da imagem.
+        for widget in (self.shadow_heights, self.detect_buildings):
+            widget.setEnabled(checked)
+            if not checked:
+                widget.setChecked(False)
 
     def _on_bbox(self, bbox: Optional[BBox]) -> None:
         self.bbox = bbox
@@ -402,6 +414,7 @@ class MainWindow(QWidget):
             elevation_exaggeration=self.exaggeration.value(),
             extra_footprints=self.extra_footprints.isChecked(),
             shadow_heights=self.shadow_heights.isChecked(),
+            detect_buildings=self.detect_buildings.isChecked(),
         )
 
     def _start(self, kind: str) -> None:

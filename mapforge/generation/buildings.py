@@ -31,6 +31,9 @@ CLASS_LEVELS: dict[BuildingClass, tuple[int, int]] = {
     BuildingClass.MALL: (1, 3),
 }
 
+# Faixa para contorno detectado na imagem, onde a area nao e informativa.
+DETECTED_LEVELS = (1, 2)
+
 # building=* que sobrescreve a faixa vinda da area.
 TYPE_LEVELS: dict[str, tuple[int, int]] = {
     "house": (1, 2),
@@ -107,7 +110,15 @@ def _choose_levels(building: Building, ctx: GenerationContext, rng) -> float:
     if building.levels and building.levels >= 1:
         return float(building.levels)
 
-    low, high = TYPE_LEVELS.get(building.building_type, CLASS_LEVELS[building.classify()])
+    if building.tags.get("source") == "deteccao":
+        # Contorno vindo da deteccao por imagem: a area nao diz nada sobre
+        # altura, porque manchas vizinhas se fundem. Classificar por area faria
+        # um quarteirao de casas terreas virar torre de dez andares.
+        low, high = DETECTED_LEVELS
+    else:
+        low, high = TYPE_LEVELS.get(
+            building.building_type, CLASS_LEVELS[building.classify()]
+        )
 
     # Constroi um viés: quanto maior a area dentro da faixa da classe, mais alto.
     weight = rng.beta(2.0, 2.6)

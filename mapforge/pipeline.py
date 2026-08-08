@@ -117,6 +117,33 @@ def generate(
         if cache is not None:
             cache.flush_tiles()
 
+    # Ultima fonte de edificios: detectar na imagem. So depois do OSM e dos
+    # contornos abertos, e so onde eles nao chegaram.
+    detection = None
+    if imagery is not None and settings.detect_buildings and settings.buildings:
+        from .core.features import Building, FeatureKind
+        from .imagery.detect import detect_buildings
+
+        if progress:
+            progress("procurando telhados na imagem", 0.44)
+        try:
+            detection = detect_buildings(imagery, map_data)
+            start_id = -100_000
+            for offset, polygon in enumerate(detection.polygons):
+                map_data.buildings.append(
+                    Building(
+                        osm_id=start_id - offset,
+                        kind=FeatureKind.BUILDING,
+                        tags={"source": "deteccao"},
+                        footprint=polygon,
+                        building_type="yes",
+                    )
+                )
+            if progress:
+                progress(f"detectados na imagem: +{len(detection.polygons)}", 0.47)
+        except Exception as exc:  # noqa: BLE001 - a cena segue sem a deteccao
+            log.warning("Deteccao de edificios falhou: %s", exc)
+
     terrain = None
     elevation_grid = None
     if settings.elevation:
@@ -157,6 +184,9 @@ def generate(
             "meters_per_pixel": round(imagery.meters_per_pixel, 3),
             "attribution": imagery.attribution,
         }
+
+    if detection is not None:
+        scene.metadata["detection"] = detection.summary()
 
     if elevation_grid is not None:
         scene.metadata["elevation"] = {

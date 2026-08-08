@@ -116,6 +116,7 @@ Fontes de edifícios:
 
 ```powershell
 --footprints              # completa o OSM com os contornos abertos da Microsoft
+--detect-buildings        # detecta telhados na imagem (exige --satellite)
 --shadow-heights          # estima altura pela sombra na imagem (exige --satellite)
 ```
 
@@ -170,11 +171,14 @@ O OpenStreetMap só tem prédio onde alguém desenhou. Em cidade pequena isso co
 dar dois ou três prédios num quarteirão inteiro, e a cena sai vazia. Medindo em
 quadrados de 800 m:
 
-| Região | OSM | Com `--footprints` |
-|---|---|---|
-| Santa Bárbara, MG | **5** | **1105** |
-| Tiradentes, MG | 407 | 502 |
-| Centro de SP | 1816 | 1816 |
+Três fontes, aplicadas em cascata — cada uma só preenche o que a anterior deixou:
+
+| Região | OSM | `--footprints` | `--detect-buildings` |
+|---|---|---|---|
+| Santa Bárbara, MG | **5** | **1105** | — |
+| Araioses, MA | **12** | 12 (sem cobertura) | **1103** |
+| Tiradentes, MG | 407 | 502 | +98 |
+| Centro de SP | 1816 | 1816 | — |
 
 `--footprints` acrescenta o **GlobalMLBuildingFootprints** da Microsoft: 1,4 bilhão
 de contornos extraídos de imagem de satélite por rede neural, publicados sob ODbL.
@@ -192,6 +196,45 @@ Particionamento por quadkey de zoom 9 (~78 km de lado): um arquivo cobre uma reg
 inteira. O primeiro download é grande (10–30 MB) e lento, depois fica em cache e o
 custo é zero. O índice (7 MB) também é cacheado, por 60 dias.
 
+### Quando nem isso cobre: `--detect-buildings`
+
+O conjunto da Microsoft tem buracos. O quadkey `211000300`, que cobre Araioses-MA e
+todo o delta do Parnaíba, simplesmente não existe no índice — embora São Luís,
+Teresina e Fortaleza existam. Lá, `--footprints` não acrescenta nada.
+
+`--detect-buildings` é a última linha: procura telhados na própria imagem. Sozinha,
+classificação de pixel por cor confunde telhado com solo exposto. O que torna o
+resultado utilizável é usar **o mapa 2D do OSM como filtro**:
+
+- onde há rua, água ou mata, não há telhado;
+- casa fica perto de rua — candidato a mais de 70 m de qualquer via é descartado;
+- o que já existe como edifício (OSM ou Microsoft) sai da disputa antes.
+
+Duas famílias de pixel são aceitas, porque no Brasil o telhado ou é cerâmica
+(R > G > B, saturado) ou é laje/fibrocimento (claro e dessaturado). Vegetação é
+recortada pelo excesso de verde, que é o discriminador mais confiável em banda
+visível. Depois vêm abertura e fechamento morfológicos, componentes conexos e um
+retângulo orientado ajustado por PCA sobre os pixels de cada mancha.
+
+O contorno devolvido é esse retângulo, não o telhado exato — para uma cena low-poly
+isso é melhor do que um blob irregular ruidoso, e é o que mais se parece com uma casa
+vista de cima.
+
+Duas armadilhas que custaram uma rodada em Araioses:
+
+1. **Casas geminadas viram uma mancha só.** Uma mancha de 1100 m² classificada por
+   área virava um prédio de dez andares numa cidade térrea. Agora manchas grandes são
+   fatiadas numa grade de unidades do tamanho de uma casa — mas só quando o
+   preenchimento do retângulo é baixo. Telhado limpo e cheio é galpão ou escola de
+   verdade e fica inteiro.
+2. **A área de um contorno detectado não diz nada sobre altura.** Prédios vindos da
+   detecção são tratados como térreos ou sobrados, independentemente da área; só tag
+   do OSM ou sombra confiável os levantam.
+
+Exige imagem com pelo menos ~1,2 m/pixel. Como o zoom cai conforme a região cresce,
+áreas muito grandes desligam a detecção automaticamente — para cidade pequena, use
+raios de até ~600 m.
+
 ### Altura
 
 O conjunto da Microsoft não traz altura no Brasil (vem `-1`). A altura sai, em ordem
@@ -206,7 +249,9 @@ Como não sabemos a data nem a hora da captura do tile, a elevação solar não 
 calculável; o estimador se **auto-calibra**: a direção da sombra sai da própria
 imagem (a direção em que a vizinhança dos prédios escurece, varrida em 36 ângulos)
 e a escala sai dos prédios que já têm altura no OSM. Sem prédios de referência
-suficientes a estimativa continua relativa e é marcada como de baixa confiança.
+suficientes o resultado é **descartado** com um aviso, e a altura volta a ser
+procedural — um chute sobre a elevação solar produz altura pior do que a regra por
+área.
 
 ## Imagem de satélite
 
@@ -413,12 +458,13 @@ O renderizador offscreen é software puro: ~9 s para 77 mil triângulos, ~90 s p
 py -3.11 -m pytest tests -q
 ```
 
-161 testes, sem rede: geometria e winding das malhas, parser (com fixture Overpass),
+182 testes, sem rede: geometria e winding das malhas, parser (com fixture Overpass),
 suavização de eixos, classificação viária, escavação da água, matemática de tiles e
 quadkeys, detecção do tile-placeholder, decodificação Terrarium, exatidão do campo de
-altura, drapejamento, fusão de contornos (incluindo a rejeição de duplicatas), todas
-as formas de telhado, todas as espécies de árvore, amostragem de cores, quantização,
-determinismo da seed, combinações de estilo × detalhe, e exportação com reimportação.
+altura, drapejamento, fusão de contornos (incluindo a rejeição de duplicatas),
+classificação de pixel e divisão de manchas do detector, todas as formas de telhado,
+todas as espécies de árvore, amostragem de cores, quantização, determinismo da seed,
+combinações de estilo × detalhe, e exportação com reimportação.
 
 ## Limitações conhecidas
 
@@ -441,6 +487,11 @@ determinismo da seed, combinações de estilo × detalhe, e exportação com rei
 - Sem editor: não dá para mover, apagar ou trocar objetos individualmente (Fase 5).
 - Os contornos da Microsoft não têm classificação de uso: todo prédio acrescentado
   entra como genérico, então a altura procedural dele cai na regra por área.
+- A detecção por imagem devolve retângulos orientados, não contornos exatos, e não
+  distingue casa de galpão. Serve para povoar a cena com volumes plausíveis onde não
+  há dado nenhum — não para levantamento cadastral.
+- A detecção não funciona em área grande: o zoom do satélite cai conforme a região
+  cresce e abaixo de ~1,2 m/pixel ela se desliga sozinha.
 - A estimativa por sombra precisa de imagem com pelo menos ~1 m/pixel, prédio
   isolado o bastante para a sombra não cair no vizinho, e prédios de referência com
   altura conhecida para calibrar. Onde isso não existe, ela não é aplicada.
