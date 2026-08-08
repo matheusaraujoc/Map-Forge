@@ -23,6 +23,7 @@ _DETAIL_PRESETS: dict[str, dict[str, Any]] = {
         "roof_detail": False,
         "road_markings": False,
         "building_detail": False,
+        "street_furniture": False,
     },
     "medium": {
         "buffer_segments": 2,
@@ -33,6 +34,7 @@ _DETAIL_PRESETS: dict[str, dict[str, Any]] = {
         "roof_detail": True,
         "road_markings": True,
         "building_detail": True,
+        "street_furniture": True,
     },
     "high": {
         "buffer_segments": 4,
@@ -43,6 +45,7 @@ _DETAIL_PRESETS: dict[str, dict[str, Any]] = {
         "roof_detail": True,
         "road_markings": True,
         "building_detail": True,
+        "street_furniture": True,
     },
 }
 
@@ -54,6 +57,11 @@ class GenerationSettings:
     seed: int = 1
     style: str = "lowpoly"
     detail: str = "medium"
+    # None = deduzido da latitude da regiao.
+    region: Optional[str] = None
+    # Forca o porte do assentamento ('povoado', 'pequena', 'media', 'grande')
+    # em vez de medi-lo nos contornos. None = medir.
+    urban_scale: Optional[str] = None
 
     terrain: bool = True
     roads: bool = True
@@ -61,6 +69,8 @@ class GenerationSettings:
     water: bool = True
     vegetation: bool = True
     sidewalks: bool = True
+    structures: bool = True  # torres, silos, postes mapeados no OSM
+    street_lamps: bool = True  # iluminacao publica, deduzida do tracado
     windows: Optional[bool] = None  # None = usa o padrao do estilo/detalhe
 
     tree_density: float = 1.0
@@ -83,13 +93,23 @@ class GenerationSettings:
     texture_saturation: float = 0.92
 
     # --- fontes extras de edificios ---
+    # Overture Maps: conflacao OSM + Microsoft + Esri + Google Open Buildings,
+    # a mesma base que o Google Maps serve no celular. Melhor fonte disponivel
+    # para cidade pequena brasileira; exige duckdb.
+    overture: bool = False
     # Completa o OSM com os contornos abertos da Microsoft (ODbL), extraidos de
-    # imagem de satelite. E o que enche a cidade pequena.
+    # imagem de satelite. Reserva para quando o Overture nao estiver acessivel.
     extra_footprints: bool = False
     shadow_heights: bool = False  # estima altura pela sombra na imagem
     # Ultima linha: detecta telhados na propria imagem onde nenhuma fonte de
     # contorno cobre. Exige satellite=True.
     detect_buildings: bool = False
+
+    # --- vegetacao ---
+    # Encontra mata e gramado na foto. Diferente da deteccao de telhado, aqui o
+    # sinal e confiavel e nao ha fonte pronta equivalente: o OSM quase nunca
+    # desenha mata em cidade pequena. Exige satellite=True.
+    detect_vegetation: bool = False
 
     # --- relevo ---
     elevation: bool = False
@@ -124,14 +144,29 @@ class GenerationContext:
         progress: Optional[ProgressFn] = None,
         imagery=None,
         terrain=None,
+        clip=None,
     ):
         self.bbox = bbox
         self.settings = settings or GenerationSettings()
         self.projection = projection or LocalProjection.for_bbox(bbox)
         self.style: Style = get_style(self.settings.style)
         self.palette: Palette = self.style.palette()
+
+        # Perfil regional pela latitude do centro (ou forcado nas configuracoes):
+        # e o que decide chamine x caixa d'agua, e o vies de telhado e vegetacao.
+        from .region import get_profile, profile_for_latitude
+
+        self.region = (
+            get_profile(self.settings.region)
+            if self.settings.region
+            else profile_for_latitude(bbox.center[0])
+        )
         self.detail = dict(_DETAIL_PRESETS[self.settings.detail])
         self._progress = progress
+
+        # Porte do assentamento. Medido nos contornos em `build_scene`, quando o
+        # MapData ja existe; e o que impede um galpao de povoado virar torre.
+        self.urban = None
 
         # Imagem de satelite georreferenciada (GeoImage) e o que dela deriva.
         self.imagery = imagery
@@ -143,6 +178,9 @@ class GenerationContext:
 
         # Campo de altura (TerrainField) ou None quando o terreno e plano.
         self.terrain = terrain
+        # Poligono de recorte em metros locais, quando a regiao foi desenhada a
+        # mao em vez de escolhida como retangulo. None = a bbox inteira.
+        self.clip = clip
 
         if self.settings.windows is not None:
             self.detail["windows"] = self.settings.windows
@@ -189,4 +227,5 @@ class GenerationContext:
         except Exception:  # noqa: BLE001 - mantem o original em caso de falha
             return geom
         return geom if simplified.is_empty else simplified
+
 

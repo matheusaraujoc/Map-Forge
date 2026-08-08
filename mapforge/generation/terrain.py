@@ -29,6 +29,15 @@ log = logging.getLogger(__name__)
 # Passo da malha do terreno (metros) por nivel de detalhe.
 GRID_STEP = {"low": 18.0, "medium": 10.0, "high": 6.0}
 
+# Teto de celulas da grade, independente do nivel de detalhe. Sem ele, uma
+# regiao de 11 km2 em detalhe alto pedia 615 mil triangulos so de terreno e a
+# geracao levava mais de dois minutos. O passo e afrouxado ate caber.
+MAX_GRID_CELLS = 60_000
+
+# Nao adianta uma grade mais fina que o proprio DEM: os tiles Terrarium tem
+# cerca de 4,5 m por pixel, entao abaixo disso so se interpola o mesmo dado.
+MIN_USEFUL_STEP = 4.5
+
 
 @dataclass
 class TerrainField:
@@ -48,6 +57,19 @@ class TerrainField:
         exaggeration: float = 1.0,
     ) -> "TerrainField":
         half_w, half_h = bbox.width_m / 2.0, bbox.height_m / 2.0
+
+        step = max(float(step), MIN_USEFUL_STEP, grid.meters_per_pixel * 0.9)
+        # Afrouxa o passo ate a grade caber no teto de celulas.
+        cells = (bbox.width_m / step) * (bbox.height_m / step)
+        if cells > MAX_GRID_CELLS:
+            step *= float(np.sqrt(cells / MAX_GRID_CELLS))
+            log.info(
+                "Passo do terreno afrouxado para %.1f m: a regiao de %.1f km2 nao cabe "
+                "na grade do nivel de detalhe",
+                step,
+                bbox.area_km2,
+            )
+
         nx = max(int(bbox.width_m / step) + 1, 2)
         ny = max(int(bbox.height_m / step) + 1, 2)
         xs = np.linspace(-half_w, half_w, nx)
@@ -152,6 +174,11 @@ class TerrainField:
     def relief(self) -> float:
         return float(self.z.max() - self.z.min())
 
+    @property
+    def step(self) -> float:
+        """Espacamento da grade, em metros."""
+        return float(self.xs[1] - self.xs[0]) if len(self.xs) > 1 else 1.0
+
 
 # ------------------------------------------------------------------- geradores
 
@@ -194,6 +221,15 @@ def generate_terrain(builder: MeshBuilder, ctx: GenerationContext, water_union=N
 
     field = ctx.terrain
     if field is not None:
+        if ctx.clip is not None:
+            # Regiao desenhada a mao: o terreno vira uma superficie assentada
+            # sobre o relevo, recortada pelo mesmo poligono que recortou o resto.
+            builder.add_flat(
+                material, ctx.clip, layers.Z_GROUND, uv_bounds=uv_bounds, drape=True
+            )
+            _add_polygon_skirt(builder, ctx, ctx.clip, field)
+            return
+
         vertices, faces = field.mesh()
         uv = None
         if textured:
@@ -208,7 +244,7 @@ def generate_terrain(builder: MeshBuilder, ctx: GenerationContext, water_union=N
         _add_skirt(builder, ctx, field)
         return
 
-    ground = box(-half_w, -half_h, half_w, half_h)
+    ground = ctx.clip if ctx.clip is not None else box(-half_w, -half_h, half_w, half_h)
     if water_union is not None and not water_union.is_empty:
         try:
             ground = ground.difference(water_union)
@@ -216,6 +252,8 @@ def generate_terrain(builder: MeshBuilder, ctx: GenerationContext, water_union=N
             pass
     if not ground.is_empty:
         builder.add_flat(material, ground, layers.Z_GROUND, uv_bounds=uv_bounds)
+        if ctx.clip is not None:
+            _add_polygon_skirt(builder, ctx, ctx.clip, None)
 
 
 def _add_skirt(builder: MeshBuilder, ctx: GenerationContext, field: TerrainField) -> None:
@@ -244,6 +282,53 @@ def _add_skirt(builder: MeshBuilder, ctx: GenerationContext, field: TerrainField
         )
         if flip:
             faces = faces[:, [0, 2, 1]]
+        builder.add_mesh(material, vertices, faces)
+
+
+def _add_polygon_skirt(builder: MeshBuilder, ctx: GenerationContext, clip, field) -> None:
+    """Parede lateral ao longo do contorno desenhado, fechando o volume."""
+    from shapely import segmentize
+
+    polys = [clip] if clip.geom_type == "Polygon" else list(getattr(clip, "geoms", []))
+    material = ctx.palette.bank
+
+    for poly in polys:
+        if poly.geom_type != "Polygon" or poly.is_empty:
+            continue
+        # Densifica para a saia acompanhar o relevo do contorno.
+        passo = float(getattr(field, "step", 0.0) or 0.0) / 2.0 if field is not None else 0.0
+        borda = poly.exterior if passo <= 0 else segmentize(poly.exterior, passo)
+        coords = np.asarray(borda.coords, dtype=np.float64)[:-1]
+        if len(coords) < 3:
+            continue
+
+        topo_z = np.zeros(len(coords))
+        if field is not None:
+            topo_z = np.asarray(field.height(coords[:, 0], coords[:, 1]), dtype=np.float64)
+        fundo = float(topo_z.min()) - max(
+            (float(topo_z.max()) - float(topo_z.min())) * 0.15, 8.0
+        )
+
+        n = len(coords)
+        nxt = np.roll(coords, -1, axis=0)
+        topo_nxt = np.roll(topo_z, -1)
+        vertices = np.concatenate(
+            [
+                np.column_stack([coords, topo_z]),
+                np.column_stack([nxt, topo_nxt]),
+                np.column_stack([nxt, np.full(n, fundo)]),
+                np.column_stack([coords, np.full(n, fundo)]),
+            ],
+            axis=0,
+        )
+        idx = np.arange(n)
+        faces = np.concatenate(
+            [
+                np.column_stack([idx, idx + n, idx + 2 * n]),
+                np.column_stack([idx, idx + 2 * n, idx + 3 * n]),
+            ],
+            axis=0,
+        )
         builder.add_mesh(material, vertices, faces)
 
 
@@ -294,4 +379,9 @@ def generate_landuse(builder: MeshBuilder, ctx: GenerationContext, map_data) -> 
     _draw_areas(
         builder, ctx, map_data.parkings, palette.parking, areas.get("parking", {}),
         layers.Z_PARKING,
+    )
+    # Lavoura: tom proprio, entre a terra exposta e o gramado.
+    _draw_areas(
+        builder, ctx, map_data.farmlands, palette.farmland, areas.get("farmland", {}),
+        layers.Z_GREEN - 0.005,
     )

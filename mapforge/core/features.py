@@ -135,6 +135,37 @@ class Railway(Feature):
     gauge_width: float = 3.2
 
 
+class StructureKind(str, Enum):
+    """Estrutura vertical isolada, que nao e edificio nem vegetacao."""
+
+    MAST = "mast"  # torre de telefonia / antena
+    WATER_TOWER = "water_tower"  # caixa d'agua elevada
+    SILO = "silo"  # silo ou tanque, tipico de zona rural
+    CHIMNEY = "chimney"  # chamine industrial
+    PYLON = "pylon"  # torre de transmissao
+    POLE = "pole"  # poste de energia
+    WINDMILL = "windmill"
+    BILLBOARD = "billboard"
+
+
+@dataclass
+class Structure(Feature):
+    """Torre, poste, silo: objeto vertical posicionado num ponto."""
+
+    position: Point = None  # type: ignore[assignment]
+    structure: StructureKind = StructureKind.MAST
+    height: Optional[float] = None
+    footprint: Optional[Polygon] = None  # quando o OSM mapeou como area
+
+
+@dataclass
+class Farmland(Feature):
+    """Area agricola: lavoura, vinhedo, sede de fazenda."""
+
+    geometry: Polygon = None  # type: ignore[assignment]
+    crop: str = ""
+
+
 @dataclass
 class Tree(Feature):
     position: Point = None  # type: ignore[assignment]
@@ -155,6 +186,8 @@ class MapData:
     parkings: list[Parking] = field(default_factory=list)
     railways: list[Railway] = field(default_factory=list)
     trees: list[Tree] = field(default_factory=list)
+    structures: list[Structure] = field(default_factory=list)
+    farmlands: list[Farmland] = field(default_factory=list)
 
     def summary(self) -> dict[str, int]:
         return {
@@ -167,6 +200,8 @@ class MapData:
             "parkings": len(self.parkings),
             "railways": len(self.railways),
             "trees": len(self.trees),
+            "structures": len(self.structures),
+            "farmlands": len(self.farmlands),
         }
 
     def is_empty(self) -> bool:

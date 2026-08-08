@@ -129,15 +129,139 @@ class MeshBuilder:
     relevo em vez de ficarem no plano z=0.
     """
 
-    def __init__(self, terrain=None) -> None:
+    def __init__(self, terrain=None, clip=None) -> None:
         self._groups: dict[str, _Group] = {}
         self.terrain = terrain
+        # Contorno da regiao, quando ela foi desenhada a mao. As superficies sao
+        # recortadas por ele na hora de virar malha: o parser recorta o *eixo*
+        # da via, mas a largura e aplicada depois, entao sem isto a calcada
+        # avanca alguns metros no vazio.
+        self.clip = clip
+        # Aresta maxima ao assentar no relevo. Precisa ser bem menor que o passo
+        # da grade do terreno: uma aresta longa vira uma corda reta por cima de
+        # um terreno curvo, e a rua atravessa o morro.
+        step = getattr(terrain, "step", None)
+        self.drape_edge = max(float(step) / 3.0, 0.5) if step else 0.0
+        # Folga sobre o terreno quando ha relevo. Com o recorte por triangulo o
+        # erro geometrico e zero, entao isto e so margem de seguranca visual.
+        self.drape_bias = 0.08 if terrain is not None else 0.0
+        # Triangulos do terreno e o indice espacial deles, construidos uma vez
+        # so: sao milhares, e o recorte acontece a cada camada assentada.
+        self._cells = None
+        self._cell_tree = None
 
     def _drape(self, points_xy: np.ndarray) -> np.ndarray:
         """Altura do terreno nos pontos dados (zero quando nao ha relevo)."""
         if self.terrain is None:
             return np.zeros(len(points_xy))
         return np.asarray(self.terrain.height(points_xy[:, 0], points_xy[:, 1]), dtype=np.float64)
+
+    def clipped(self, geom):
+        """Recorta pelo contorno da regiao, quando ha um desenhado."""
+        if self.clip is None or geom is None or geom.is_empty:
+            return geom
+        try:
+            cut = geom.intersection(self.clip)
+        except Exception:  # noqa: BLE001 - topologia ruim: deixa passar
+            return geom
+        return cut
+
+    def densify(self, geom):
+        """Insere vertices ao longo das bordas para acompanhar o relevo."""
+        if self.terrain is None or self.drape_edge <= 0 or geom is None or geom.is_empty:
+            return geom
+        try:
+            from shapely import segmentize
+
+            return segmentize(geom, self.drape_edge)
+        except Exception:  # noqa: BLE001 - segue com a geometria original
+            return geom
+
+    def grid_split(self, geom) -> list:
+        """Recorta a geometria pelas celulas da grade do terreno.
+
+        Densificar a borda nao basta: o earcut liga vertices distantes, e num
+        corredor de rua isso produz triangulos com arestas de centenas de
+        metros que passam reto por cima do morro (medido: a rua afundava 6,5 m,
+        com arestas de ate 410 m).
+
+        O recorte usa a mesma grade da malha do terreno, entao cada peca cai
+        dentro de uma celula, onde o relevo e praticamente plano - e a
+        superficie assentada passa a acompanhar o terreno de perto.
+        """
+        if self.terrain is None or geom is None or geom.is_empty:
+            return [geom] if geom is not None else []
+
+        import shapely
+        from shapely.ops import polygonize, unary_union
+
+        xs = getattr(self.terrain, "xs", None)
+        ys = getattr(self.terrain, "ys", None)
+        if xs is None or ys is None or len(xs) < 2 or len(ys) < 2:
+            return [geom]
+
+        minx, miny, maxx, maxy = geom.bounds
+        # So as linhas de grade que cruzam a geometria.
+        cut_x = xs[(xs > minx) & (xs < maxx)]
+        cut_y = ys[(ys > miny) & (ys < maxy)]
+        if len(cut_x) + len(cut_y) == 0:
+            return [geom]
+        if len(cut_x) * len(cut_y) > 250_000:  # protecao contra area absurda
+            return [geom]
+
+        from shapely.geometry import LineString
+
+        grade = [LineString([(x, miny), (x, maxy)]) for x in cut_x]
+        grade += [LineString([(minx, y), (maxx, y)]) for y in cut_y]
+
+        # Sobreposicao planar de uma vez so: noda o contorno da geometria com as
+        # linhas de grade e remonta as faces. A versao anterior intersectava
+        # cada celula contra a geometria inteira - com a uniao das vias de uma
+        # cidade isso custava minutos, porque cada uma das milhares de operacoes
+        # percorria a geometria toda.
+        try:
+            noded = unary_union([geom.boundary, *grade])
+            faces = list(polygonize(noded))
+        except Exception:  # noqa: BLE001 - topologia ruim: segue sem recortar
+            return [geom]
+        if not faces:
+            return [geom]
+
+        # `polygonize` devolve tambem as faces de fora; o ponto interno decide.
+        shapely.prepare(geom)
+        pontos = shapely.point_on_surface(np.array(faces, dtype=object))
+        dentro = shapely.contains(geom, pontos)
+        return [face for face, ok in zip(faces, dentro) if ok]
+
+    def _terrain_cells(self):
+        """Celulas da grade do terreno + STRtree, construidas uma vez so.
+
+        Sao as celulas quadradas, nao os dois triangulos de cada uma. Dentro de
+        uma celula o terreno tem uma dobra na diagonal, mas a diferenca que ela
+        causa e uma fracao da torcao da celula - bem abaixo da folga de 8 cm com
+        que as superficies sao assentadas. Usar quadrados corta pela metade o
+        numero de geometrias, e esse numero e o que dita o custo.
+        """
+        if self._cells is not None:
+            return self._cells, self._cell_tree
+
+        xs = getattr(self.terrain, "xs", None)
+        ys = getattr(self.terrain, "ys", None)
+        if xs is None or ys is None or len(xs) < 2 or len(ys) < 2:
+            return None, None
+        if (len(xs) - 1) * (len(ys) - 1) > 250_000:  # protecao contra area absurda
+            return None, None
+
+        import shapely
+        from shapely import STRtree
+
+        # Vetorizado: `shapely.box` sobre arrays cria todas as celulas de uma
+        # vez. Num laco Python isto sozinho levava dezenas de segundos.
+        x0, y0 = np.meshgrid(xs[:-1], ys[:-1], indexing="ij")
+        x1, y1 = np.meshgrid(xs[1:], ys[1:], indexing="ij")
+        self._cells = shapely.box(x0.ravel(), y0.ravel(), x1.ravel(), y1.ravel())
+        self._cell_tree = STRtree(self._cells)
+        return self._cells, self._cell_tree
 
     # ------------------------------------------------------------------ base
 
@@ -193,13 +317,35 @@ class MeshBuilder:
         `drape` faz a superficie acompanhar o relevo: z passa a ser a folga
         acima do terreno, nao a altura absoluta.
         """
+        geom = self.clipped(geom)
+        if geom is None or geom.is_empty:
+            return
+        if drape and self.terrain is not None:
+            # Recorta pelos triangulos do terreno antes de triangular, senao o
+            # earcut cria triangulos que atravessam varios morros. O recorte ja
+            # insere os vertices nas bordas das celulas, entao nao ha o que
+            # densificar aqui.
+            for piece in self.grid_split(geom):
+                self._add_flat_piece(material, piece, z, flip, uv_bounds, drape=True)
+            return
+        self._add_flat_piece(material, geom, z, flip, uv_bounds, drape=False)
+
+    def _add_flat_piece(
+        self,
+        material: Material,
+        geom,
+        z: float,
+        flip: bool,
+        uv_bounds: tuple[float, float, float, float] | None,
+        drape: bool,
+    ) -> None:
         for poly in _as_polygons(geom):
             verts2d, faces = _triangulate(poly)
             if len(faces) == 0:
                 continue
             heights = np.full(len(verts2d), z)
             if drape:
-                heights = heights + self._drape(verts2d)
+                heights = heights + self._drape(verts2d) + self.drape_bias
             verts = np.column_stack([verts2d, heights])
             if flip:
                 faces = faces[:, [0, 2, 1]]
@@ -230,6 +376,11 @@ class MeshBuilder:
         Com `drape`, base e topo sobem juntos com o terreno: a parede mantem a
         espessura e acompanha a encosta (util no degrau da calcada).
         """
+        geom = self.clipped(geom)
+        if geom is None or geom.is_empty:
+            return
+        if drape:
+            geom = self.densify(geom)
         for poly in _as_polygons(geom):
             rings = [poly.exterior] + list(poly.interiors)
             for ring in rings:
@@ -243,7 +394,7 @@ class MeshBuilder:
                     continue
                 nxt = np.roll(coords, -1, axis=0)
 
-                ground0 = self._drape(coords) if drape else np.zeros(n)
+                ground0 = (self._drape(coords) + self.drape_bias) if drape else np.zeros(n)
                 ground1 = np.roll(ground0, -1) if drape else np.zeros(n)
 
                 # Para cada aresta: base(p0), base(p1), topo(p1), topo(p0).

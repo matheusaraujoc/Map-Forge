@@ -11,6 +11,14 @@ DATA_DIR = Path(os.environ.get("MAPFORGE_DATA", ROOT / "data"))
 OUTPUT_DIR = Path(os.environ.get("MAPFORGE_OUTPUT", ROOT / "output"))
 CACHE_DB = DATA_DIR / "mapforge.db"
 
+# Espelhos publicos do Overpass, tentados em ordem. Responder 504 quando esta
+# ocupado e comportamento normal desses servidores, entao ter varios importa
+# mais do que ter o "melhor".
+#
+# ATENCAO: so entra aqui espelho com o planeta inteiro. Varias instancias
+# publicas servem so um pais - overpass.osm.ch, por exemplo, responde rapido e
+# com sucesso para o Brasil, mas devolve zero elementos, porque so tem a Suica.
+# Um espelho assim envenena o cache e o mapa sai vazio sem nenhum erro.
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",

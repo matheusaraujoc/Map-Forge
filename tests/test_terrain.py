@@ -197,12 +197,74 @@ def test_prisma_drapeado_mantem_a_espessura():
     verts = builder.build()["m"].vertices
 
     # Em cada coluna (x, y) a diferenca topo-base tem de continuar 0.16.
-    chaves: dict[tuple, list] = {}
+    # O recorte pela grade do terreno repete vertices nas bordas das celulas,
+    # entao a comparacao e sobre alturas distintas, nao sobre a contagem bruta.
+    chaves: dict[tuple, set] = {}
     for x, y, z in verts:
-        chaves.setdefault((round(x, 3), round(y, 3)), []).append(z)
+        chaves.setdefault((round(x, 3), round(y, 3)), set()).add(round(float(z), 6))
     espessuras = [max(v) - min(v) for v in chaves.values() if len(v) > 1]
     assert espessuras
-    assert all(e == pytest.approx(0.16, abs=1e-6) for e in espessuras)
+    assert all(e == pytest.approx(0.16, abs=1e-5) for e in espessuras)
+
+
+def _wavy_field(step: float = 8.0) -> TerrainField:
+    """Terreno ondulado: e onde o assentamento errado aparece."""
+    rows = cols = 120
+    half_w, half_h = BBOX.width_m / 2, BBOX.height_m / 2
+    xs = np.linspace(-half_w, half_w, cols)
+    ys = np.linspace(half_h, -half_h, rows)
+    mesh_x, mesh_y = np.meshgrid(xs, ys)
+    heights = 12.0 * np.sin(mesh_x / 120.0 * 2 * np.pi) + 6.0 * np.cos(mesh_y / 90.0 * 2 * np.pi)
+    return TerrainField.from_grid(BBOX, _grid(heights), step=step)
+
+
+def test_rua_longa_nao_atravessa_o_morro():
+    """Regressao: um corredor com poucos vertices afundava 6,5 m no relevo.
+
+    A causa era o earcut ligar vertices distantes do poligono, produzindo
+    triangulos com arestas de centenas de metros que cortam reto por cima do
+    terreno. O recorte pelos triangulos do terreno elimina isso.
+    """
+    field = _wavy_field()
+    faixa = LineString([(-400, 0), (400, 30)]).buffer(4.0, quad_segs=2)
+    assert len(faixa.exterior.coords) < 20  # poucos vertices, como vem do OSM
+
+    builder = MeshBuilder(terrain=field)
+    builder.add_flat(Material("via", (0.4, 0.4, 0.4)), faixa, 0.05, drape=True)
+    group = builder.build()["via"]
+
+    centros = group.vertices[group.faces].mean(axis=1)
+    esperado = field.height(centros[:, 0], centros[:, 1]) + 0.05 + builder.drape_bias
+    desvio = centros[:, 2] - esperado
+    assert np.abs(desvio).max() < 0.02, f"a rua desviou {np.abs(desvio).max():.2f} m do terreno"
+
+
+def test_superficie_assentada_fica_sempre_acima_do_terreno():
+    field = _wavy_field()
+    faixa = LineString([(-300, -100), (300, 120)]).buffer(6.0, quad_segs=2)
+
+    builder = MeshBuilder(terrain=field)
+    builder.add_flat(Material("via", (0.4, 0.4, 0.4)), faixa, 0.05, drape=True)
+    group = builder.build()["via"]
+
+    altura_terreno = field.height(group.vertices[:, 0], group.vertices[:, 1])
+    assert (group.vertices[:, 2] > altura_terreno).all()
+
+
+def test_recorte_pela_grade_cobre_a_mesma_area():
+    field = _wavy_field()
+    builder = MeshBuilder(terrain=field)
+    original = LineString([(-200, 0), (200, 50)]).buffer(5.0, quad_segs=2)
+
+    pieces = builder.grid_split(original)
+    assert len(pieces) > 20
+    assert sum(p.area for p in pieces) == pytest.approx(original.area, rel=1e-6)
+
+
+def test_recorte_nao_acontece_sem_relevo():
+    builder = MeshBuilder(terrain=None)
+    geom = box(0, 0, 100, 100)
+    assert builder.grid_split(geom) == [geom]
 
 
 def test_sem_terreno_o_drape_nao_faz_nada():

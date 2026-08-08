@@ -39,31 +39,83 @@ def _stage(progress: Optional[ProgressFn], start: float, span: float) -> Progres
     return inner
 
 
+def polygon_to_local(coords, projection: LocalProjection):
+    """Contorno em (lat, lon) -> poligono Shapely em metros locais."""
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    if not coords or len(coords) < 3:
+        return None
+    points = projection.project_many([(float(a), float(b)) for a, b in coords])
+    polygon = ShapelyPolygon(points)
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)
+    return polygon if (polygon is not None and not polygon.is_empty) else None
+
+
 def load_map(
     bbox: BBox,
     cache: Optional[Cache] = None,
     force_download: bool = False,
     progress: Optional[ProgressFn] = None,
     extra_footprints: bool = False,
+    overture: bool = False,
+    clip_area=None,
+    raw_osm=None,
+    raw_overture=None,
 ) -> tuple[MapData, LocalProjection]:
     """Baixa (ou le do cache) e converte para objetos internos.
 
-    Com `extra_footprints`, completa os edificios do OSM com os contornos
-    abertos da Microsoft - o que salva cidade pequena, onde o OSM costuma ter
-    dois ou tres predios desenhados.
+    Cidade pequena costuma ter dois ou tres predios desenhados no OSM, e a cena
+    sai vazia. Duas fontes abertas completam, nesta ordem:
+
+    - `overture`: conflacao OSM + Microsoft + Esri + Google Open Buildings. E o
+      mesmo dado que o Google Maps serve no celular, e cobre onde as outras
+      falham (em Araioses-MA: 5.382 predios, contra 15 do OSM).
+    - `extra_footprints`: o conjunto da Microsoft, mantido como reserva para
+      quando o Overture estiver fora do ar ou o duckdb nao estiver instalado.
+
+    O que ja existe no MapData sempre vence, entao rodar as duas nao duplica.
     """
-    raw = download_region(bbox, cache=cache, force=force_download, progress=_stage(progress, 0.0, 0.45))
+    # `raw_osm` permite reaproveitar um download maior: na geracao em blocos, a
+    # regiao inteira e baixada de uma vez e cada bloco so recorta.
+    raw = raw_osm
+    if raw is None:
+        raw = download_region(
+            bbox, cache=cache, force=force_download, progress=_stage(progress, 0.0, 0.45)
+        )
     if progress:
         progress("interpretando dados do OSM", 0.5)
     projection = LocalProjection.for_bbox(bbox)
-    map_data = parse_osm(raw, bbox, projection)
+    map_data = parse_osm(raw, bbox, projection, clip_area=clip_area)
+
+    if overture or raw_overture is not None:
+        from .data import fetch_overture, merge_into
+
+        try:
+            # `raw_overture` reaproveita uma consulta maior, como o `raw_osm`:
+            # na geracao em blocos a regiao inteira e consultada de uma vez.
+            found = (
+                raw_overture
+                if raw_overture is not None
+                else fetch_overture(
+                    bbox, cache=cache, progress=_stage(progress, 0.55, 0.2),
+                    force=force_download,
+                )
+            )
+            added = merge_into(map_data, found, projection, source="overture", id_base=-1_000_000)
+            if progress:
+                progress(f"Overture: +{added} edificios", 0.78)
+        except Exception as exc:  # noqa: BLE001 - a cena continua sem ele
+            log.warning("Overture indisponivel: %s", exc)
+            if progress:
+                progress(f"Overture falhou ({exc})", 0.78)
 
     if extra_footprints:
         from .data import fetch_footprints, merge_into
 
         try:
             found = fetch_footprints(
-                bbox, cache=cache, progress=_stage(progress, 0.55, 0.3), force=force_download
+                bbox, cache=cache, progress=_stage(progress, 0.78, 0.1), force=force_download
             )
             added = merge_into(map_data, found, projection)
             if progress:
@@ -86,9 +138,20 @@ def generate(
     cache: Optional[Cache] = None,
     force_download: bool = False,
     progress: Optional[ProgressFn] = None,
+    clip_polygon=None,
+    raw_osm=None,
+    raw_overture=None,
 ) -> GenerationResult:
-    """Pipeline completo: download -> parser -> geracao -> (opcional) exportacao."""
+    """Pipeline completo: download -> parser -> geracao -> (opcional) exportacao.
+
+    `clip_polygon` e uma lista de (lat, lon) fechando um contorno. Quando
+    informado, a cena e recortada por ele em vez do retangulo da bbox - a bbox
+    continua valendo para os downloads, que sao sempre retangulares.
+    """
     settings = settings or GenerationSettings()
+
+    projection = LocalProjection.for_bbox(bbox)
+    clip_area = polygon_to_local(clip_polygon, projection) if clip_polygon else None
 
     map_data, projection = load_map(
         bbox,
@@ -96,6 +159,10 @@ def generate(
         force_download,
         _stage(progress, 0.0, 0.30),
         extra_footprints=settings.extra_footprints,
+        overture=settings.overture,
+        clip_area=clip_area,
+        raw_osm=raw_osm,
+        raw_overture=raw_overture,
     )
     if map_data.is_empty():
         raise RuntimeError(
@@ -144,6 +211,43 @@ def generate(
         except Exception as exc:  # noqa: BLE001 - a cena segue sem a deteccao
             log.warning("Deteccao de edificios falhou: %s", exc)
 
+    # Vegetacao pela imagem. Ao contrario do telhado, aqui a deteccao ganha de
+    # longe: o OSM quase nunca desenha mata em cidade pequena (Araioses tem
+    # zero), e o excesso de verde e um sinal robusto. Roda depois dos edificios
+    # porque usa os contornos para nao plantar arvore em cima de telhado.
+    if imagery is not None and settings.detect_vegetation and settings.vegetation:
+        from .core.features import FeatureKind, Forest, Park
+        from .imagery.canopy import detect_canopy
+
+        if progress:
+            progress("procurando vegetacao na imagem", 0.48)
+        try:
+            copa = detect_canopy(imagery, map_data)
+            base_id = -200_000
+            for offset, poly in enumerate(copa.canopy_polygons):
+                map_data.forests.append(
+                    Forest(
+                        osm_id=base_id - offset,
+                        kind=FeatureKind.FOREST,
+                        tags={"source": "deteccao", "natural": "wood"},
+                        geometry=poly,
+                    )
+                )
+            base_id = -300_000
+            for offset, poly in enumerate(copa.grass_polygons):
+                map_data.parks.append(
+                    Park(
+                        osm_id=base_id - offset,
+                        kind=FeatureKind.PARK,
+                        tags={"source": "deteccao", "landuse": "grass"},
+                        geometry=poly,
+                    )
+                )
+            if progress:
+                progress(f"vegetacao detectada: {copa.summary()}", 0.50)
+        except Exception as exc:  # noqa: BLE001 - a cena segue sem a deteccao
+            log.warning("Deteccao de vegetacao falhou: %s", exc)
+
     terrain = None
     elevation_grid = None
     if settings.elevation:
@@ -174,6 +278,7 @@ def generate(
         progress=_stage(progress, 0.52, 0.36),
         imagery=imagery,
         terrain=terrain,
+        clip=clip_area,
     )
     scene = build_scene(map_data, ctx)
     if imagery is not None:

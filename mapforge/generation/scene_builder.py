@@ -13,6 +13,7 @@ from .buildings import generate_buildings
 from .coloring import build_area_materials, build_ground_color, build_roof_materials
 from .context import GenerationContext
 from .roads import generate_railways, generate_roads
+from .structures import generate_street_lamps, generate_structures
 from .terrain import generate_landuse, generate_terrain
 from .vegetation import generate_vegetation
 from .water import generate_water
@@ -23,8 +24,19 @@ log = logging.getLogger(__name__)
 def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
     """Executa o pipeline de geracao na ordem em que as camadas se empilham."""
     started = time.perf_counter()
-    builder = MeshBuilder(terrain=ctx.terrain)
+    builder = MeshBuilder(terrain=ctx.terrain, clip=ctx.clip)
     stats: dict[str, int] = {}
+
+    # Porte do assentamento antes de qualquer geometria: e o teto de pavimentos
+    # de todo predio sem altura em tag.
+    from .urban import SCALES, profile_for
+
+    if ctx.settings.urban_scale:
+        forcado = {s.key: s for s in SCALES}.get(ctx.settings.urban_scale)
+        ctx.urban = forcado or profile_for(map_data, ctx.bbox)
+    else:
+        ctx.urban = profile_for(map_data, ctx.bbox)
+    ctx.report(f"porte: {ctx.urban.label}", 0.02)
 
     if ctx.imagery is not None:
         ctx.report("amostrando cores reais", 0.03)
@@ -70,8 +82,9 @@ def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
 
     # A uniao dos footprints e usada para recortar as calcadas; vale o custo
     # porque sem ela a calcada atravessa o terreo dos predios de esquina.
+    # Serve a dois usos: recortar a calcada e impedir arvore dentro de casa.
     building_union = None
-    if ctx.settings.sidewalks and ctx.settings.buildings and map_data.buildings:
+    if ctx.settings.buildings and map_data.buildings:
         try:
             building_union = unary_union([b.footprint for b in map_data.buildings if b.footprint])
         except Exception as exc:  # noqa: BLE001 - segue sem o recorte
@@ -87,8 +100,18 @@ def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
     ctx.report("edificios", 0.45)
     stats["buildings"] = generate_buildings(builder, ctx, map_data.buildings)
 
-    ctx.report("vegetacao", 0.80)
-    stats["trees"] = generate_vegetation(builder, ctx, map_data, exclude=roads.paved_union)
+    ctx.report("vegetacao", 0.78)
+    # Arvore nao nasce dentro de casa: o que ja foi construido tambem exclui.
+    # Sem isto copa e telhado se atravessam, que era o defeito mais visivel.
+    excluir = roads.paved_union
+    if building_union is not None and not building_union.is_empty:
+        recuo = building_union.buffer(1.5)
+        excluir = recuo if excluir is None else unary_union([excluir, recuo])
+    stats["trees"] = generate_vegetation(builder, ctx, map_data, exclude=excluir)
+
+    ctx.report("torres, silos e iluminacao", 0.88)
+    stats["structures"] = generate_structures(builder, ctx, map_data.structures)
+    stats["lamps"] = generate_street_lamps(builder, ctx, roads)
 
     ctx.report("finalizando malha", 0.95)
     groups = builder.build()

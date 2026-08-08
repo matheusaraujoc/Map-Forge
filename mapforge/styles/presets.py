@@ -62,6 +62,7 @@ class Style:
     road_line: Color | None = None  # sinalizacao horizontal
     water_bed: Color | None = None  # leito, abaixo da lamina
     bank: Color | None = None  # talude da margem
+    farmland: Color | None = None  # lavoura
 
     # Parametros de geracao influenciados pelo estilo.
     height_scale: float = 1.0
@@ -129,6 +130,13 @@ class Palette:
     def bank(self) -> Material:
         color = self.style.bank or _mix(self.style.ground, self.style.grass, 0.35)
         return self._make("bank", color)
+
+    @property
+    def farmland(self) -> Material:
+        # Lavoura fica entre a terra exposta e o gramado.
+        color = self.style.farmland or _mix(self.style.dirt or self.style.footway,
+                                            self.style.grass, 0.45)
+        return self._make("farmland", color)
 
     @property
     def sidewalk(self) -> Material:

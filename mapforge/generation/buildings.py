@@ -16,6 +16,7 @@ from shapely.geometry import Polygon
 from ..core.features import Building, BuildingClass
 from ..core.mesh import Material, MeshBuilder
 from . import layers
+from .archetypes import archetype_for
 from .context import GenerationContext
 
 log = logging.getLogger(__name__)
@@ -90,6 +91,67 @@ FLAT_ROOF_TYPES = {
 }
 
 
+_ARCHETYPE_MATERIALS: dict[str, Material] = {}
+
+
+def _archetype_material(name: str, color, ctx: GenerationContext) -> Material:
+    """Material fixo de um equipamento urbano, reaproveitado entre predios."""
+    material = _ARCHETYPE_MATERIALS.get(name)
+    if material is None:
+        material = _ARCHETYPE_MATERIALS[name] = Material(
+            name=name, color=tuple(float(c) for c in color), roughness=ctx.style.roughness
+        )
+    return material
+
+
+def _add_church_tower(
+    builder: MeshBuilder,
+    poly: Polygon,
+    base_z: float,
+    wall_top: float,
+    wall_mat: Material,
+    roof_mat: Material,
+    rng,
+) -> None:
+    """Campanario numa das pontas da nave.
+
+    E o marco visual de qualquer cidade pequena brasileira - sem ele a igreja
+    fica indistinguivel de um galpao.
+    """
+    obb = poly.minimum_rotated_rectangle
+    if not isinstance(obb, Polygon):
+        return
+    corners = np.asarray(obb.exterior.coords, dtype=np.float64)[:-1]
+    if len(corners) != 4:
+        return
+    if np.linalg.norm(corners[1] - corners[0]) < np.linalg.norm(corners[2] - corners[1]):
+        corners = np.roll(corners, -1, axis=0)
+
+    a, b, c, d = corners
+    # Ponta da nave, no meio do lado curto.
+    front = (a + d) / 2.0
+    axis = (b - a)
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+
+    half = min(np.linalg.norm(d - a) * 0.28, 2.6)
+    if half < 1.0:
+        return
+    center = front + axis * half * 1.1
+    tower = Polygon(
+        [
+            center + np.array([-half, -half]),
+            center + np.array([half, -half]),
+            center + np.array([half, half]),
+            center + np.array([-half, half]),
+        ]
+    )
+
+    top = wall_top + rng.uniform(3.5, 7.0)
+    builder.add_prism(wall_mat, tower, base_z, top, cap_top=False)
+    # Coruchéu piramidal.
+    _hip_roof(builder, tower, top, half * 1.6, roof_mat)
+
+
 def _to_number(value) -> float | None:
     """Le um numero de uma tag do OSM ('12', '12 m', '12.5')."""
     if not value:
@@ -110,7 +172,10 @@ def _choose_levels(building: Building, ctx: GenerationContext, rng) -> float:
     if building.levels and building.levels >= 1:
         return float(building.levels)
 
-    if building.tags.get("source") == "deteccao":
+    archetype = archetype_for(building.tags)
+    if archetype is not None:
+        low, high = archetype.levels
+    elif building.tags.get("source") == "deteccao":
         # Contorno vindo da deteccao por imagem: a area nao diz nada sobre
         # altura, porque manchas vizinhas se fundem. Classificar por area faria
         # um quarteirao de casas terreas virar torre de dez andares.
@@ -119,6 +184,23 @@ def _choose_levels(building: Building, ctx: GenerationContext, rng) -> float:
         low, high = TYPE_LEVELS.get(
             building.building_type, CLASS_LEVELS[building.classify()]
         )
+
+    # Limite de esbeltez: nao existe torre de dez andares sobre 28 m2. Sem isto,
+    # um hospital mapeado como quatro pavilhoes pequenos vira quatro torres -
+    # foi o que apareceu em Araioses, onde `building=hospital` pedia 3 a 10
+    # pavimentos para pedacos de 28 m2.
+    slenderness_cap = max(math.sqrt(max(building.area, 1.0)) / 1.8, 1.0)
+    high = min(high, slenderness_cap)
+
+    # Teto do assentamento: area grande num povoado e galpao, escola ou igreja -
+    # construcao larga e baixa -, nao predio alto. Sem isto, a faixa BLOCK
+    # (700-3.500 m2 -> 4 a 14 pavimentos) punha uma torre de doze andares e 42 m
+    # no meio de Araioses, que nao tem um unico predio acima de tres.
+    urban = getattr(ctx, "urban", None)
+    if urban is not None:
+        high = min(high, float(urban.max_levels))
+
+    low = min(low, high)
 
     # Constroi um viés: quanto maior a area dentro da faixa da classe, mais alto.
     weight = rng.beta(2.0, 2.6)
@@ -196,7 +278,9 @@ def _pick_roof(building: Building, ctx: GenerationContext, rng, poly: Polygon) -
     elif poly.area > 1200:
         return "flat"
     else:
-        weights = ctx.style.roof_weights
+        # O estilo define a mistura; a regiao a inclina (telhado plano e raro
+        # onde neva, mansarda e rara no tropico).
+        weights = ctx.region.roof_weights(ctx.style.roof_weights)
         options = [k for k, w in weights.items() if w > 0]
         if not options:
             return "flat"
@@ -497,6 +581,14 @@ def _add_balconies(
                 builder.add_prism(material, rail, z0 + 0.22, z0 + 1.15, cap_top=True)
 
 
+def _roof_accessory_spot(poly: Polygon, rng) -> tuple[float, float]:
+    """Um ponto sobre o telhado, deslocado do centro."""
+    point = poly.representative_point()
+    offset = np.sqrt(poly.area) * 0.22
+    angle = rng.uniform(0, 2 * np.pi)
+    return point.x + np.cos(angle) * offset, point.y + np.sin(angle) * offset
+
+
 def _add_chimney(
     builder: MeshBuilder,
     poly: Polygon,
@@ -504,12 +596,8 @@ def _add_chimney(
     material: Material,
     rng,
 ) -> None:
-    """Chamine numa casa de telhado inclinado."""
-    point = poly.representative_point()
-    offset = np.sqrt(poly.area) * 0.22
-    angle = rng.uniform(0, 2 * np.pi)
-    cx = point.x + np.cos(angle) * offset
-    cy = point.y + np.sin(angle) * offset
+    """Chamine numa casa de telhado inclinado (regiao fria)."""
+    cx, cy = _roof_accessory_spot(poly, rng)
     half = rng.uniform(0.28, 0.42)
     stack = Polygon(
         [(cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half), (cx - half, cy + half)]
@@ -650,11 +738,20 @@ def generate_buildings(
             continue
 
         rng = ctx.rng(building.osm_id, int(poly.area))
+        archetype = archetype_for(building.tags)
+
         wall_mat = palette.wall(int(rng.integers(0, n_walls)))
         # A cor amostrada do satelite tem prioridade sobre a paleta do estilo.
         roof_mat = ctx.roof_materials.get(building.osm_id) or palette.roof(
             int(rng.integers(0, n_roofs))
         )
+        if archetype is not None:
+            # Equipamento urbano tem cor propria: quartel vermelho, hospital
+            # branco. Sobrepoe a paleta, mas nao a cor medida no satelite.
+            if archetype.wall_color:
+                wall_mat = _archetype_material(f"wall_{archetype.name}", archetype.wall_color, ctx)
+            if archetype.roof_color and building.osm_id not in ctx.roof_materials:
+                roof_mat = _archetype_material(f"roof_{archetype.name}", archetype.roof_color, ctx)
 
         height, level_height = _building_height(building, ctx, rng)
         base_z = layers.Z_GROUND + building.min_height
@@ -667,6 +764,11 @@ def generate_buildings(
         builder.add_walls(wall_mat, poly, base_z, wall_top)
 
         roof = _pick_roof(building, ctx, rng, poly)
+        if archetype is not None and archetype.roof:
+            # Galpao e posto tem telhado ditado pela funcao, nao pelo estilo.
+            forced = archetype.roof
+            if forced != "gable" or _rectangularity(poly) >= 0.72:
+                roof = forced
         # roof:height / roof:levels do OSM dao a altura da cobertura direto.
         tagged_pitch = _to_number(building.tags.get("roof:height"))
         if tagged_pitch is None:
@@ -702,12 +804,24 @@ def generate_buildings(
             if ctx.detail.get("building_detail"):
                 if height > 4.0 and poly.area > 45:
                     _add_plinth(builder, poly, base_z, palette.curb)
-                if roof in {"gable", "hip"} and poly.area < 400 and rng.random() < 0.45:
+                # Chamine so onde faz sentido pelo clima. A caixa d'agua que
+                # existia aqui foi removida: na escala da cena ela virava um
+                # borrao cinza no telhado, sem leitura nenhuma.
+                if (
+                    poly.area < 400
+                    and roof in {"gable", "hip"}
+                    and rng.random() < ctx.region.chimneys
+                ):
                     _add_chimney(builder, poly, roof_top, wall_mat, rng)
-                if height > 14.0 and poly.area > 150 and rng.random() < 0.55:
+                # Sacada e de predio residencial; escola e galpao nao tem.
+                horizontal = archetype is not None and archetype.wide
+                if height > 14.0 and poly.area > 150 and not horizontal and rng.random() < 0.55:
                     _add_balconies(
                         builder, poly, base_z, wall_top, level_height, wall_mat, rng
                     )
+
+        if archetype is not None and archetype.tower and poly.area > 60:
+            _add_church_tower(builder, poly, base_z, wall_top, wall_mat, roof_mat, rng)
 
         generated += 1
         if index % 400 == 0:

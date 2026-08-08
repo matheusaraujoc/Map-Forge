@@ -67,6 +67,7 @@ def _settings_from_args(args) -> GenerationSettings:
         seed=args.seed,
         style=args.style,
         detail=args.detail,
+        region=args.region,
         terrain=not args.no_terrain,
         roads=not args.no_roads,
         buildings=not args.no_buildings,
@@ -86,9 +87,12 @@ def _settings_from_args(args) -> GenerationSettings:
         elevation=args.elevation,
         elevation_zoom=args.elevation_zoom,
         elevation_exaggeration=args.exaggeration,
+        overture=args.overture,
         extra_footprints=args.footprints,
         shadow_heights=args.shadow_heights,
         detect_buildings=args.detect_buildings,
+        detect_vegetation=args.detect_vegetation,
+        urban_scale=args.urban_scale,
     )
 
 
@@ -196,6 +200,59 @@ def cmd_preview(args) -> int:
     return 0
 
 
+def cmd_region(args) -> int:
+    """Gera uma regiao grande em blocos, com manifesto de montagem."""
+    from .tiling import generate_tiled, plan_tiles
+
+    bbox, label = _resolve_bbox(args)
+    settings = _settings_from_args(args)
+
+    plano, cols, rows = plan_tiles(bbox, args.tile_km)
+    print(
+        f"  regiao : {bbox.width_m / 1000:.1f} x {bbox.height_m / 1000:.1f} km "
+        f"({bbox.area_km2:.1f} km2)"
+    )
+    print(f"  blocos : {cols} x {rows} = {len(plano)} de {args.tile_km} km de lado")
+    if args.dry_run:
+        for tile in plano[:8]:
+            print(f"    r{tile.row:02d}c{tile.col:02d}  deslocamento {tile.offset} m")
+        if len(plano) > 8:
+            print(f"    ... e mais {len(plano) - 8}")
+        return 0
+
+    nome = args.name or "".join(
+        c if c.isalnum() or c in "-_" else "_" for c in label
+    )[:40].strip("_") or "regiao"
+    destino = Path(args.out) if args.out else config.OUTPUT_DIR / nome
+
+    progress = Progress(not args.quiet)
+    with Cache() as cache:
+        resultado = generate_tiled(
+            bbox,
+            settings=settings,
+            output_dir=destino,
+            name=nome,
+            tile_km=args.tile_km,
+            cache=cache,
+            progress=progress,
+            skip_existing=args.resume,
+        )
+    progress.done()
+
+    falhas = [t for t in resultado.tiles if t.error]
+    print()
+    print(f"  gerados  : {len(resultado.ok)} de {len(resultado.tiles)} blocos")
+    print(f"  malha    : {resultado.triangles:,} triangulos, {resultado.buildings:,} edificios")
+    print(f"  tempo    : {resultado.seconds}s")
+    print(f"  pasta    : {destino}")
+    print(f"  manifesto: {resultado.manifest}")
+    if falhas:
+        print(f"  {len(falhas)} bloco(s) sem dados ou com erro:")
+        for tile in falhas[:5]:
+            print(f"    r{tile.row:02d}c{tile.col:02d}: {tile.error[:70]}")
+    return 0
+
+
 def cmd_satellite(args) -> int:
     """Baixa so a imagem, para conferir a resolucao antes de gerar a cena."""
     from .imagery import fetch_imagery
@@ -245,6 +302,47 @@ def cmd_gui(_args) -> int:
             f"interface grafica indisponivel ({exc}). Instale com: pip install PySide6"
         ) from None
     return run_gui()
+
+
+def cmd_segment(args) -> int:
+    """Converte a imagem de satelite num desenho 2D classificado por cobertura."""
+    from .data import download_region, parse_osm
+    from .imagery import fetch_imagery
+    from .imagery.detect import detect_buildings
+    from .imagery.segment import classify, render
+
+    bbox, label = _resolve_bbox(args)
+    progress = Progress(not args.quiet)
+
+    with Cache() as cache:
+        geo = fetch_imagery(
+            bbox, provider_name=args.provider, cache=cache,
+            zoom=args.satellite_zoom, progress=progress, force=args.force,
+        )
+        cache.flush_tiles()
+        map_data = parse_osm(download_region(bbox, cache=cache, progress=progress), bbox)
+    progress.done()
+
+    seg = classify(geo, map_data)
+
+    poligonos = None
+    if args.with_buildings:
+        deteccao = detect_buildings(geo, map_data)
+        poligonos = deteccao.polygons
+        print(f"  deteccao : {deteccao.summary()}")
+
+    saida = Path(args.out) if args.out else _default_output(label, GenerationSettings()).with_name(
+        f"classificado_{label[:24].replace(' ', '_')}.png"
+    )
+    render(seg, saida, geo=geo, side_by_side=not args.only_map, polygons=poligonos)
+
+    print()
+    print(f"  imagem   : {geo.size[0]}x{geo.size[1]} px, {geo.meters_per_pixel:.2f} m/pixel")
+    print("  cobertura:")
+    for chave, fracao in sorted(seg.fractions().items(), key=lambda kv: -kv[1]):
+        print(f"    {chave:<16} {fracao * 100:5.1f}%")
+    print(f"  desenho  : {saida}")
+    return 0
 
 
 def cmd_providers(_args) -> int:
@@ -356,6 +454,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--detail", default="medium", choices=("low", "medium", "high"), help="nivel de detalhe"
     )
     gen.add_argument("--seed", type=int, default=1, help="seed da geracao procedural")
+    gen.add_argument(
+        "--region",
+        default=None,
+        help="perfil regional (tropical, subtropical, temperada, boreal). "
+        "Padrao: deduzido da latitude",
+    )
     gen.add_argument("--tree-density", type=float, default=1.0, dest="tree_density")
     gen.add_argument("--max-trees", type=int, default=40_000, dest="max_trees")
     gen.add_argument("--height-scale", type=float, default=1.0, dest="height_scale")
@@ -411,10 +515,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fontes = gen.add_argument_group("fontes de edificios")
     fontes.add_argument(
+        "--overture",
+        action="store_true",
+        help="completa o OSM com o Overture Maps (OSM + Microsoft + Esri + Google "
+        "Open Buildings) - a melhor fonte para cidade pequena; exige duckdb",
+    )
+    fontes.add_argument(
         "--footprints",
         action="store_true",
         help="completa o OSM com os contornos abertos da Microsoft "
-        "(essencial em cidade pequena; primeiro download por regiao e grande)",
+        "(reserva do --overture; primeiro download por regiao e grande)",
     )
     fontes.add_argument(
         "--detect-buildings",
@@ -422,6 +532,21 @@ def build_parser() -> argparse.ArgumentParser:
         dest="detect_buildings",
         help="detecta telhados na propria imagem onde nao ha contorno pronto "
         "(exige --satellite; aproximado, retangulos orientados)",
+    )
+    fontes.add_argument(
+        "--urban-scale",
+        dest="urban_scale",
+        choices=("povoado", "pequena", "media", "grande"),
+        default=None,
+        help="forca o porte do assentamento, que e o teto de pavimentos de predio "
+        "sem altura em tag (padrao: medir nos proprios contornos)",
+    )
+    fontes.add_argument(
+        "--detect-vegetation",
+        action="store_true",
+        dest="detect_vegetation",
+        help="encontra mata e gramado na imagem (exige --satellite); o OSM quase "
+        "nunca desenha mata em cidade pequena",
     )
     fontes.add_argument(
         "--shadow-heights",
@@ -459,6 +584,57 @@ def build_parser() -> argparse.ArgumentParser:
     styles = sub.add_parser("styles", help="lista os estilos disponiveis")
     styles.set_defaults(func=cmd_styles)
 
+    region = sub.add_parser(
+        "region",
+        help="gera uma regiao grande em blocos (sem limite de area) + manifesto",
+        description="Corta a regiao em blocos, gera um de cada vez e grava o "
+        "manifesto de montagem. E o caminho para cidade inteira.",
+    )
+    _add_region_args(region)
+    region.add_argument("--out", help="pasta de saida")
+    region.add_argument("--name", help="nome base dos arquivos")
+    region.add_argument(
+        "--tile-km", type=float, default=1.5, dest="tile_km",
+        help="lado do bloco em km (padrao: 1.5)",
+    )
+    region.add_argument(
+        "--resume", action="store_true", help="pula blocos ja gerados na pasta"
+    )
+    region.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="so mostra o plano de blocos, sem gerar",
+    )
+    # Mesmas opcoes de geracao do comando `generate`.
+    region.add_argument("--style", default="lowpoly")
+    region.add_argument("--detail", default="medium", choices=("low", "medium", "high"))
+    region.add_argument("--region", default=None, dest="region")
+    region.add_argument("--seed", type=int, default=1)
+    region.add_argument("--tree-density", type=float, default=1.0, dest="tree_density")
+    region.add_argument("--max-trees", type=int, default=40_000, dest="max_trees")
+    region.add_argument("--height-scale", type=float, default=1.0, dest="height_scale")
+    region.add_argument("--satellite", action="store_true")
+    region.add_argument("--provider", default="esri")
+    region.add_argument("--satellite-zoom", type=int, default=None, dest="satellite_zoom")
+    region.add_argument("--roof-blend", type=float, default=0.75, dest="roof_blend")
+    region.add_argument("--area-blend", type=float, default=0.55, dest="area_blend")
+    region.add_argument("--ground-texture", action="store_true", dest="ground_texture")
+    region.add_argument("--overture", action="store_true")
+    region.add_argument("--footprints", action="store_true")
+    region.add_argument("--detect-buildings", action="store_true", dest="detect_buildings")
+    region.add_argument("--detect-vegetation", action="store_true", dest="detect_vegetation")
+    region.add_argument(
+        "--urban-scale", dest="urban_scale", default=None,
+        choices=("povoado", "pequena", "media", "grande"),
+    )
+    region.add_argument("--shadow-heights", action="store_true", dest="shadow_heights")
+    region.add_argument("--relief", action="store_true", dest="elevation")
+    region.add_argument("--relief-zoom", type=int, default=None, dest="elevation_zoom")
+    region.add_argument("--exaggeration", type=float, default=1.0)
+    for flag in ("no-terrain", "no-roads", "no-buildings", "no-water",
+                 "no-vegetation", "no-sidewalks", "no-windows"):
+        region.add_argument(f"--{flag}", action="store_true", dest=flag.replace("-", "_"))
+    region.set_defaults(func=cmd_region)
+
     satellite = sub.add_parser(
         "satellite", help="baixa so a imagem de satelite da regiao (para conferir a resolucao)"
     )
@@ -467,6 +643,26 @@ def build_parser() -> argparse.ArgumentParser:
     satellite.add_argument("--provider", default="esri")
     satellite.add_argument("--satellite-zoom", type=int, default=None, dest="satellite_zoom")
     satellite.set_defaults(func=cmd_satellite)
+
+    segment = sub.add_parser(
+        "segment",
+        help="converte a imagem de satelite num desenho 2D classificado",
+        description="Desenha o que o sistema enxerga na foto: telha, laje, "
+        "vegetacao, solo, agua e sombra, cada uma com a sua cor.",
+    )
+    _add_region_args(segment)
+    segment.add_argument("--out", help="arquivo PNG de saida")
+    segment.add_argument("--provider", default="esri")
+    segment.add_argument("--satellite-zoom", type=int, default=None, dest="satellite_zoom")
+    segment.add_argument(
+        "--only-map", action="store_true", dest="only_map",
+        help="grava so o desenho, sem a foto ao lado",
+    )
+    segment.add_argument(
+        "--with-buildings", action="store_true", dest="with_buildings",
+        help="desenha por cima os contornos que o detector extraiu",
+    )
+    segment.set_defaults(func=cmd_segment)
 
     providers = sub.add_parser("providers", help="lista as fontes de imagem de satelite")
     providers.set_defaults(func=cmd_providers)

@@ -133,7 +133,8 @@ class RoadResult:
 
     surface_union: object | None = None  # pistas no nivel do solo
     paved_union: object | None = None  # pistas + calcadas no nivel do solo
-    centerlines: list[tuple[LineString, float]] = field(default_factory=list)
+    # (eixo, meia-largura, classe) - usado pela iluminacao publica.
+    centerlines: list[tuple[LineString, float, RoadClass]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------- sinalizacao
@@ -157,7 +158,55 @@ def _drape(builder: MeshBuilder, vertices: np.ndarray) -> np.ndarray:
         return vertices
     vertices = vertices.copy()
     vertices[:, 2] += builder.terrain.height(vertices[:, 0], vertices[:, 1])
-    return vertices
+    return vertices + [0.0, 0.0, builder.drape_bias]
+
+
+def _emit(builder: MeshBuilder, material: Material, vertices: np.ndarray, faces: np.ndarray) -> None:
+    """Assenta e envia uma malha ja triangulada, respeitando o contorno.
+
+    A sinalizacao e construida como faixas prontas, sem passar por add_flat,
+    entao o recorte da regiao desenhada precisa ser aplicado aqui - senao a
+    pintura de solo avanca alguns metros para fora do terreno.
+    """
+    vertices = _drape(builder, vertices)
+    if builder.clip is not None and len(faces):
+        import shapely
+
+        # Exige os tres vertices dentro: testar o centroide deixaria a metade
+        # externa de um triangulo que cruza a borda passar.
+        pontos = vertices[faces]
+        dentro = shapely.contains_xy(
+            builder.clip, pontos[:, :, 0].ravel(), pontos[:, :, 1].ravel()
+        ).reshape(len(faces), 3)
+        faces = faces[dentro.all(axis=1)]
+        if not len(faces):
+            return
+
+        # Compacta: sem isto os vertices das faces descartadas continuariam no
+        # buffer, sem triangulo nenhum, e viajariam ate o arquivo exportado.
+        usados = np.unique(faces)
+        remapa = np.full(len(vertices), -1, dtype=np.int64)
+        remapa[usados] = np.arange(len(usados))
+        vertices = vertices[usados]
+        faces = remapa[faces]
+    builder.add_mesh(material, vertices, faces)
+
+
+def _densify_coords(builder: MeshBuilder, coords: np.ndarray) -> np.ndarray:
+    """Reamostra o eixo para a sinalizacao acompanhar o relevo.
+
+    A faixa de bordo e uma fita entre duas polilinhas com os mesmos vertices do
+    eixo. Num trecho reto de 200 m o eixo tem dois pontos, e a fita passaria
+    reta por cima do morro.
+    """
+    if builder.terrain is None or builder.drape_edge <= 0 or len(coords) < 2:
+        return coords
+    line = LineString(coords)
+    if line.length <= builder.drape_edge:
+        return coords
+    from shapely import segmentize
+
+    return np.asarray(segmentize(line, builder.drape_edge).coords, dtype=np.float64)
 
 
 def _quads_to_mesh(quads: np.ndarray, z: float) -> tuple[np.ndarray, np.ndarray]:
@@ -247,7 +296,7 @@ def _add_crossing(
         trimmed = line
     if trimmed.is_empty or trimmed.length < 1.5:
         return
-    coords = np.asarray(trimmed.coords, dtype=np.float64)
+    coords = _densify_coords(builder, np.asarray(trimmed.coords, dtype=np.float64))
     if len(coords) < 2:
         return
 
@@ -257,7 +306,7 @@ def _add_crossing(
         outer = offset_polyline(coords, offset + bar_half)
         strip = _flat_strip(inner, outer, layers.Z_ROAD_LINE)
         if strip is not None:
-            builder.add_mesh(material, _drape(builder, strip[0]), strip[1])
+            _emit(builder, material, strip[0], strip[1])
 
 
 def _add_markings(
@@ -275,17 +324,18 @@ def _add_markings(
         quads = _dashes(coords, line_width=0.14)
         if quads is not None:
             verts, faces = _quads_to_mesh(quads, z)
-            builder.add_mesh(material, _drape(builder, verts), faces)
+            _emit(builder, material, verts, faces)
 
     # Faixas de bordo continuas.
     if spec.edge_lines and half_width >= 3.0:
+        coords = _densify_coords(builder, coords)
         for side in (-1.0, 1.0):
             distance = side * (half_width - 0.45)
             inner = offset_polyline(coords, distance - 0.06)
             outer = offset_polyline(coords, distance + 0.06)
             strip = _flat_strip(inner, outer, z)
             if strip is not None:
-                builder.add_mesh(material, _drape(builder, strip[0]), strip[1])
+                _emit(builder, material, strip[0], strip[1])
 
 
 # ------------------------------------------------------------------ pipeline
@@ -355,7 +405,7 @@ def generate_roads(
             continue
 
         ground_surfaces[road_surface_key(road)].append(surface)
-        centerlines.append((line, half))
+        centerlines.append((line, half, road.road_class))
 
         if ctx.detail["road_markings"] and spec.markings:
             marking_jobs.append((road, coords, half))
@@ -512,4 +562,5 @@ def generate_railways(builder: MeshBuilder, ctx: GenerationContext, railways) ->
             layers.Z_RAIL,
             drape=ctx.draped,
         )
+
 

@@ -31,12 +31,32 @@ log = logging.getLogger(__name__)
 # Faixa plausivel de area de um telhado isolado, em metros quadrados.
 MIN_AREA_M2 = 22.0
 MAX_AREA_M2 = 4000.0
+# Largura minima do lado curto: abaixo disso e lasca de recorte, nao casa.
+MIN_WIDTH_M = 3.0
 
 # Distancia maxima ate uma via para o candidato ser aceito.
 MAX_ROAD_DISTANCE_M = 70.0
 
-# Quanto do retangulo orientado precisa estar preenchido pela mancha.
-MIN_RECT_FILL = 0.55
+# Todos os limiares abaixo saem de uma varredura contra os 407 edificios que o
+# OSM tem mapeados em Tiradentes, medindo precisao e revocacao. O conjunto
+# anterior (fill 0.55, sem prova de volume) dava F1 50,9%; este da 62,3%.
+
+# Quanto do retangulo orientado precisa estar preenchido pela mancha. Frouxo de
+# proposito: apertar aqui matava casa de verdade junto com o solo exposto, e era
+# a maior causa de edificio faltando (revocacao 45% contra 65%).
+MIN_RECT_FILL = 0.42
+
+# Prova de volume. Uma mancha precisa projetar sombra do lado oposto ao sol OU
+# destoar da vizinhanca imediata; solo exposto, areia e quadra de terra batida
+# costumam falhar nas duas.
+MIN_SHADOW = 0.10
+MIN_CONTRAST = 0.10
+
+# Raios da morfologia, em metros. A abertura tira sujeira e o fechamento junta o
+# telhado partido por antena e caixa d'agua. Abrir menos parecia bom para achar
+# casa pequena, mas medido derruba a precisao: fica em 0,9.
+OPEN_M = 0.9
+CLOSE_M = 0.9
 
 # Acima desta area a mancha provavelmente e um quarteirao de casas geminadas.
 SPLIT_AREA_M2 = 300.0
@@ -49,11 +69,27 @@ MAX_METERS_PER_PIXEL = 1.2
 
 
 @dataclass
+class BlobTrace:
+    """O que aconteceu com uma mancha candidata. So para diagnostico."""
+
+    polygon: Polygon  # contorno aproximado da mancha (retangulo orientado)
+    outcome: str  # 'aceito' ou o motivo da rejeicao
+    area: float = 0.0
+    fill: float = 0.0
+    shadow: float = 0.0
+    contrast: float = 0.0
+    road_distance: float = 0.0
+
+
+@dataclass
 class DetectionResult:
     polygons: list[Polygon] = field(default_factory=list)
     candidates: int = 0
     rejected: dict[str, int] = field(default_factory=dict)
     note: str = ""
+    # Preenchido apenas quando `trace=True`: serve para desenhar o mapa de
+    # rejeicao e descobrir o que barra cada telhado.
+    traces: list[BlobTrace] = field(default_factory=list)
 
     def summary(self) -> dict:
         return {
@@ -113,13 +149,112 @@ def _roof_likelihood(rgb: np.ndarray) -> np.ndarray:
 
 
 def _morphology(mask: np.ndarray, meters_per_pixel: float) -> np.ndarray:
-    """Tira sujeira e fecha buracos, com raio proporcional a escala."""
+    """Tira sujeira e fecha buracos.
+
+    A abertura usa raio menor que o fechamento de proposito: abrir demais come
+    as casas pequenas, que sao justamente as que faltavam.
+    """
     from scipy import ndimage
 
-    radius = max(int(round(0.9 / max(meters_per_pixel, 0.05))), 1)
-    structure = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
-    cleaned = ndimage.binary_opening(mask, structure=structure)
-    return ndimage.binary_closing(cleaned, structure=structure)
+    def elemento(metros: float) -> np.ndarray:
+        r = max(int(round(metros / max(meters_per_pixel, 0.05))), 1)
+        return np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
+
+    cleaned = ndimage.binary_opening(mask, structure=elemento(OPEN_M))
+    return ndimage.binary_closing(cleaned, structure=elemento(CLOSE_M))
+
+
+def _shadow_direction(
+    luma: np.ndarray,
+    inside: np.ndarray,
+    labels: np.ndarray,
+    slices: list,
+    meters_per_pixel: float,
+    amostras: int = 160,
+) -> tuple[float, float]:
+    """Direcao em que a vizinhanca das manchas escurece = direcao da sombra.
+
+    Varre 36 direcoes num anel em volta de cada mancha candidata e fica com a
+    mais escura. Deriva das proprias manchas, e nao dos edificios do OSM, porque
+    o caso que interessa e justamente o da cidade sem edificio mapeado.
+    """
+    centros, raios = [], []
+    for index, window in enumerate(slices, start=1):
+        if window is None:
+            continue
+        altura = window[0].stop - window[0].start
+        largura = window[1].stop - window[1].start
+        if min(altura, largura) < 3:
+            continue
+        centros.append(
+            ((window[1].start + window[1].stop) / 2.0, (window[0].start + window[0].stop) / 2.0)
+        )
+        raios.append(max(altura, largura) / 2.0)
+        if len(centros) >= amostras:
+            break
+
+    if len(centros) < 5:
+        return (0.0, 0.0)  # sem amostras, o teste de sombra fica desligado
+
+    centros = np.array(centros)
+    raios = np.array(raios)
+    height, width = luma.shape
+
+    def escuridao(graus: float) -> float:
+        rad = np.radians(graus)
+        dx, dy = np.sin(rad), -np.cos(rad)
+        valores = []
+        for passo in (1.4, 2.2):
+            c = np.clip(centros[:, 0] + dx * raios * passo, 0, width - 1).astype(np.int64)
+            r = np.clip(centros[:, 1] + dy * raios * passo, 0, height - 1).astype(np.int64)
+            livre = ~inside[r, c]
+            if livre.any():
+                valores.append(float(luma[r, c][livre].mean()))
+        return float(np.mean(valores)) if valores else 1.0
+
+    grosso = min((escuridao(a), a) for a in range(0, 360, 10))[1]
+    fino = min((escuridao(a), a) for a in np.arange(grosso - 10, grosso + 10.1, 2.5))[1]
+    rad = np.radians(fino)
+    return (float(np.sin(rad)), float(-np.cos(rad)))
+
+
+def _shadow_and_contrast(
+    luma: np.ndarray,
+    inside: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    shadow: tuple[float, float],
+    reach: float,
+) -> tuple[float, float]:
+    """Duas evidencias de que a mancha e um volume, nao uma mancha de chao.
+
+    * sombra: um predio escurece o lado oposto ao sol; solo exposto nao;
+    * contraste: o telhado difere da vizinhanca imediata, o solo se confunde.
+
+    Devolve (contraste_da_sombra, contraste_local), ambos relativos.
+    """
+    dx, dy = shadow
+    height, width = luma.shape
+
+    def media(desloc_x: float, desloc_y: float) -> float:
+        c = np.clip(cols + desloc_x, 0, width - 1).astype(np.int64)
+        r = np.clip(rows + desloc_y, 0, height - 1).astype(np.int64)
+        livre = ~inside[r, c]  # ignora o que caiu noutro telhado
+        return float(luma[r, c][livre].mean()) if livre.any() else float("nan")
+
+    dentro = float(luma[rows, cols].mean())
+    lado_sombra = media(dx * reach, dy * reach)
+    lado_oposto = media(-dx * reach, -dy * reach)
+
+    sombra = 0.0
+    if np.isfinite(lado_sombra) and np.isfinite(lado_oposto) and lado_oposto > 1e-6:
+        sombra = (lado_oposto - lado_sombra) / lado_oposto
+
+    contraste = 0.0
+    if np.isfinite(lado_oposto) and max(dentro, lado_oposto) > 1e-6:
+        contraste = abs(dentro - lado_oposto) / max(dentro, lado_oposto)
+
+    return sombra, contraste
 
 
 # ------------------------------------------------------------------ geometria
@@ -221,6 +356,109 @@ def _split_block(polygon: Polygon, fill: float) -> list[Polygon]:
     return out or [polygon]
 
 
+def _resolve_placement(polygons: list[Polygon], road_geoms: list) -> list[Polygon]:
+    """Tira os predios de cima das ruas e de cima uns dos outros.
+
+    O retangulo orientado e ajustado sobre a mancha de pixels, entao ele
+    transborda para a rua sempre que o telhado encosta na calcada, e retangulos
+    de manchas vizinhas se cruzam. Os dois defeitos aparecem na cena como casa
+    dentro do asfalto e casas empilhadas.
+    """
+    if not polygons:
+        return []
+
+    import shapely
+    from shapely import STRtree
+    from shapely.ops import unary_union
+
+    # 1) Subtrai o corredor viario. Mantem o predio so se sobrar corpo util.
+    if road_geoms:
+        corridor = unary_union(road_geoms)
+        shapely.prepare(corridor)
+        kept: list[Polygon] = []
+        for polygon in polygons:
+            if not corridor.intersects(polygon):
+                kept.append(polygon)
+                continue
+            try:
+                trimmed = polygon.difference(corridor)
+            except Exception:  # noqa: BLE001 - topologia ruim
+                continue
+            for piece in _iter_polygons(trimmed):
+                # Sobra pequena ou estreita demais e resto de telhado, nao casa.
+                if piece.area >= polygon.area * 0.35 and _is_usable(piece):
+                    kept.append(piece)
+        polygons = kept
+
+    if not polygons:
+        return []
+
+    # 2) Resolve sobreposicoes: o maior fica inteiro, os menores cedem.
+    #
+    # Cada candidato so disputa com os vizinhos que o indice aponta. A versao
+    # anterior acumulava a uniao de tudo que ja tinha sido colocado e subtraia
+    # essa uniao inteira a cada predio - custo quadratico, que em Araioses
+    # (1100 casas detectadas) sozinho levava mais de dois minutos.
+    tree = STRtree(polygons)
+    ordem = sorted(range(len(polygons)), key=lambda i: polygons[i].area, reverse=True)
+
+    colocados: dict[int, Polygon] = {}
+    for index in ordem:
+        polygon = polygons[index]
+
+        vizinhos = [
+            colocados[j]
+            for j in tree.query(polygon)
+            if int(j) != index and int(j) in colocados
+        ]
+        if vizinhos:
+            # Folga para as casas nao ficarem coladas umas nas outras.
+            try:
+                obstaculo = unary_union([v.buffer(0.4) for v in vizinhos])
+            except Exception:  # noqa: BLE001
+                continue
+            if polygon.intersects(obstaculo):
+                try:
+                    polygon = polygon.difference(obstaculo)
+                except Exception:  # noqa: BLE001
+                    continue
+                pedacos = [p for p in _iter_polygons(polygon) if _is_usable(p)]
+                if not pedacos:
+                    continue
+                polygon = max(pedacos, key=lambda p: p.area)
+
+        colocados[index] = polygon
+
+    # Devolve na ordem original, para a cena nao mudar por causa da ordenacao.
+    return [colocados[i] for i in sorted(colocados)]
+
+
+def _iter_polygons(geom):
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    return [g for g in getattr(geom, "geoms", []) if g.geom_type == "Polygon" and not g.is_empty]
+
+
+def _is_usable(polygon: Polygon) -> bool:
+    """Descarta lascas: sobra estreita de recorte nao e casa.
+
+    Depois de subtrair a rua ou o vizinho, o que resta pode ser uma tira em L de
+    um metro de largura. Ela passa no filtro de area e viraria uma parede solta
+    no meio do quarteirao.
+    """
+    if polygon.is_empty or polygon.area < MIN_AREA_M2:
+        return False
+    # Erosao: se encolher pela metade da largura minima nao sobra nada, a peca
+    # e estreita em todo lugar. A caixa orientada nao serve aqui - a de um L
+    # fino e enorme, e a lasca passaria.
+    try:
+        return not polygon.buffer(-MIN_WIDTH_M / 2.0).is_empty
+    except Exception:  # noqa: BLE001 - topologia ruim
+        return False
+
+
 # ------------------------------------------------------------------- deteccao
 
 
@@ -229,6 +467,7 @@ def detect_buildings(
     map_data,
     existing: Optional[list[Polygon]] = None,
     max_road_distance: float = MAX_ROAD_DISTANCE_M,
+    trace: bool = False,
 ) -> DetectionResult:
     """Encontra telhados na imagem que ainda nao existem como edificio."""
     result = DetectionResult()
@@ -249,6 +488,7 @@ def detect_buildings(
     mpp = geo.meters_per_pixel
     pixel_area = mpp * mpp
     rgb = geo.array.astype(np.float64) / 255.0
+    luma = 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
 
     mask = _roof_likelihood(rgb)
 
@@ -290,35 +530,80 @@ def detect_buildings(
     known_mask = _rasterize(geo, known, width_m=1.0) if known else None
 
     labels, count = ndimage.label(mask)
-    result.candidates = int(count)
-    rejected = {"area": 0, "forma": 0, "longe_da_via": 0, "ja_existe": 0}
-
     slices = ndimage.find_objects(labels)
+
+    # A direcao da sombra sai das proprias manchas: em cidade sem edificio
+    # mapeado nao ha de onde tirar de outro jeito.
+    shadow_dir = _shadow_direction(luma, mask, labels, slices, mpp)
+    reach = max(2.5 / mpp, 2.0)
+
+    result.candidates = int(count)
+    rejected = {"area": 0, "forma": 0, "longe_da_via": 0, "ja_existe": 0, "sem_volume": 0}
+
+    def anotar(motivo, rows=None, cols=None, **medidas):
+        """Registra o destino de uma mancha, para o mapa de diagnostico."""
+        if not trace or rows is None or len(rows) == 0:
+            return
+        cantos, _ = _oriented_rectangle(np.column_stack([cols, rows]).astype(np.float64))
+        if len(cantos) != 4:
+            return
+        try:
+            contorno = Polygon(_pixels_to_world(geo, cantos))
+        except Exception:  # noqa: BLE001
+            return
+        if contorno.is_valid and not contorno.is_empty:
+            result.traces.append(BlobTrace(polygon=contorno, outcome=motivo, **medidas))
+
     for index, window in enumerate(slices, start=1):
         if window is None:
             continue
         sub = labels[window] == index
         pixel_count = int(sub.sum())
         area = pixel_count * pixel_area
-        if area < MIN_AREA_M2 or area > MAX_AREA_M2:
-            rejected["area"] += 1
-            continue
 
         rows, cols = np.nonzero(sub)
         rows = rows + window[0].start
         cols = cols + window[1].start
 
-        if known_mask is not None and known_mask[rows, cols].mean() > 0.25:
-            rejected["ja_existe"] += 1
+        if area < MIN_AREA_M2 or area > MAX_AREA_M2:
+            rejected["area"] += 1
+            anotar("area", rows, cols, area=area)
             continue
 
-        if road_distance[rows, cols].min() > max_road_distance:
-            rejected["longe_da_via"] += 1
+        if known_mask is not None and known_mask[rows, cols].mean() > 0.25:
+            rejected["ja_existe"] += 1
+            anotar("ja_existe", rows, cols, area=area)
             continue
+
+        distancia = float(road_distance[rows, cols].min())
+        if distancia > max_road_distance:
+            rejected["longe_da_via"] += 1
+            anotar("longe_da_via", rows, cols, area=area, road_distance=distancia)
+            continue
+
+        # Prova de volume: sombra do lado oposto ao sol, ou contraste com o
+        # entorno. Sem nenhuma das duas, e mancha de chao - solo exposto, areia,
+        # quadra de terra batida.
+        sombra = contraste = 0.0
+        if shadow_dir != (0.0, 0.0):
+            sombra, contraste = _shadow_and_contrast(
+                luma, mask, rows, cols, shadow_dir, reach
+            )
+            if sombra < MIN_SHADOW and contraste < MIN_CONTRAST:
+                rejected["sem_volume"] += 1
+                anotar(
+                    "sem_volume", rows, cols, area=area,
+                    shadow=sombra, contrast=contraste, road_distance=distancia,
+                )
+                continue
 
         corners, fill = _oriented_rectangle(np.column_stack([cols, rows]).astype(np.float64))
         if len(corners) != 4 or fill < MIN_RECT_FILL:
             rejected["forma"] += 1
+            anotar(
+                "forma", rows, cols, area=area, fill=fill,
+                shadow=sombra, contrast=contraste, road_distance=distancia,
+            )
             continue
 
         world = _pixels_to_world(geo, corners)
@@ -327,13 +612,20 @@ def detect_buildings(
             polygon = polygon.buffer(0)
         if polygon.is_empty or polygon.geom_type != "Polygon":
             rejected["forma"] += 1
+            anotar("forma", rows, cols, area=area, fill=fill)
             continue
         if polygon.area < MIN_AREA_M2:
             rejected["area"] += 1
+            anotar("area", rows, cols, area=polygon.area, fill=fill)
             continue
 
+        anotar(
+            "aceito", rows, cols, area=area, fill=fill,
+            shadow=sombra, contrast=contraste, road_distance=distancia,
+        )
         result.polygons.extend(_split_block(polygon, fill))
 
+    result.polygons = _resolve_placement(result.polygons, road_geoms)
     result.rejected = rejected
     log.info(
         "Deteccao: %d manchas -> %d edificios (rejeitados: %s)",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import random
 import sys
 from datetime import datetime
@@ -84,6 +85,7 @@ class MainWindow(QWidget):
         self.resize(1500, 940)
 
         self.bbox: Optional[BBox] = None
+        self.clip_polygon = None  # contorno desenhado a mao, quando houver
         self.worker: Optional[GenerationWorker] = None
         self.geocoder: Optional[GeocodeWorker] = None
         self.renderer: Optional[RenderWorker] = None
@@ -94,6 +96,7 @@ class MainWindow(QWidget):
 
         self.map = MapView()
         self.map.bboxSelected.connect(self._on_bbox)
+        self.map.polygonSelected.connect(self._on_polygon)
         self.map.searchRequested.connect(self._on_search)
 
         self.viewport = Viewport()
@@ -239,11 +242,22 @@ class MainWindow(QWidget):
         # --- fontes de edificios ---
         sources_box = QGroupBox("Fontes de edificios")
         sources_layout = QVBoxLayout(sources_box)
+        self.overture = QCheckBox("Completar com o Overture Maps (recomendado)")
+        self.overture.setToolTip(
+            "O OpenStreetMap so tem predio onde alguem desenhou.\n"
+            "Em cidade pequena isso costuma dar dois ou tres predios.\n\n"
+            "O Overture junta OSM, Microsoft, Esri e Google Open Buildings -\n"
+            "a mesma base que o Google Maps serve no celular.\n"
+            "Em Araioses-MA: 5.382 predios, contra 15 do OSM.\n\n"
+            "A primeira consulta de cada regiao leva de 20s a 2min e fica em cache."
+        )
+        self.overture.setChecked(True)
+        sources_layout.addWidget(self.overture)
+
         self.extra_footprints = QCheckBox("Completar com contornos abertos (Microsoft)")
         self.extra_footprints.setToolTip(
-            "O OpenStreetMap so tem predio onde alguem desenhou.\n"
-            "Em cidade pequena isso costuma dar dois ou tres predios.\n"
-            "Esta fonte traz contornos extraidos de imagem de satelite.\n\n"
+            "Reserva do Overture, para quando ele estiver fora do ar.\n"
+            "Traz contornos extraidos de imagem de satelite pela Microsoft.\n\n"
             "O primeiro download de cada regiao e grande (10-30 MB) e fica em cache."
         )
         sources_layout.addWidget(self.extra_footprints)
@@ -258,6 +272,17 @@ class MainWindow(QWidget):
         )
         self.detect_buildings.setEnabled(False)
         sources_layout.addWidget(self.detect_buildings)
+
+        self.detect_vegetation = QCheckBox("Detectar mata e gramado na imagem")
+        self.detect_vegetation.setToolTip(
+            "O OSM quase nunca desenha mata em cidade pequena - Araioses tem zero,\n"
+            "e uma mancha de floresta de 20 ha saia pelada no modelo.\n\n"
+            "Diferente do telhado, aqui a foto e um sinal confiavel: o excesso de\n"
+            "verde resiste a variacao de luz, e a textura separa copa de gramado.\n\n"
+            "Requer a imagem de satelite ligada."
+        )
+        self.detect_vegetation.setEnabled(False)
+        sources_layout.addWidget(self.detect_vegetation)
 
         self.shadow_heights = QCheckBox("Estimar altura pela sombra na imagem")
         self.shadow_heights.setToolTip(
@@ -357,13 +382,18 @@ class MainWindow(QWidget):
         for widget in (self.provider, self.roof_blend, self.area_blend, self.ground_texture):
             widget.setEnabled(checked)
         # Deteccao e estimativa por sombra precisam da imagem.
-        for widget in (self.shadow_heights, self.detect_buildings):
+        for widget in (self.shadow_heights, self.detect_buildings, self.detect_vegetation):
             widget.setEnabled(checked)
             if not checked:
                 widget.setChecked(False)
 
     def _on_bbox(self, bbox: Optional[BBox]) -> None:
         self.bbox = bbox
+        self._update_region_label()
+
+    def _on_polygon(self, pontos) -> None:
+        """Contorno desenhado a mao (ou None quando volta para retangulo)."""
+        self.clip_polygon = pontos
         self._update_region_label()
 
     def _on_search(self, text: str) -> None:
@@ -382,11 +412,33 @@ class MainWindow(QWidget):
         if self.bbox is None:
             self.region_label.setText("<i>Nenhuma regiao selecionada.</i>")
             return
-        self.region_label.setText(
-            f"<b>{self.bbox.width_m:.0f} x {self.bbox.height_m:.0f} m</b> "
-            f"({self.bbox.area_km2:.2f} km2)<br>"
-            f"<span style='color:gray'>{self.bbox.key()}</span>"
-        )
+
+        if self.clip_polygon:
+            texto = (
+                f"<b>Area desenhada</b> com {len(self.clip_polygon)} pontos<br>"
+                f"<span style='color:gray'>envolvente {self.bbox.width_m:.0f} x "
+                f"{self.bbox.height_m:.0f} m</span>"
+            )
+        else:
+            texto = (
+                f"<b>{self.bbox.width_m:.0f} x {self.bbox.height_m:.0f} m</b> "
+                f"({self.bbox.area_km2:.2f} km2)<br>"
+                f"<span style='color:gray'>{self.bbox.key()}</span>"
+            )
+        # Area grande nao trava, so demora - mas sem aviso parece travamento.
+        area = self.bbox.area_km2
+        if area > 8.0:
+            texto += (
+                "<br><span style='color:#b35300'>Area grande: a geracao pode levar "
+                "alguns minutos, e a deteccao na imagem se desliga por falta de "
+                "resolucao.</span>"
+            )
+        elif area > 3.0:
+            texto += (
+                "<br><span style='color:#7a6000'>Area media: com relevo ligado a "
+                "geracao leva dezenas de segundos.</span>"
+            )
+        self.region_label.setText(texto)
 
     # ---------------------------------------------------------------- execucao
 
@@ -412,9 +464,11 @@ class MainWindow(QWidget):
             ground_texture=self.ground_texture.isChecked(),
             elevation=self.elevation.isChecked(),
             elevation_exaggeration=self.exaggeration.value(),
+            overture=self.overture.isChecked(),
             extra_footprints=self.extra_footprints.isChecked(),
             shadow_heights=self.shadow_heights.isChecked(),
             detect_buildings=self.detect_buildings.isChecked(),
+            detect_vegetation=self.detect_vegetation.isChecked(),
         )
 
     def _start(self, kind: str) -> None:
@@ -448,6 +502,7 @@ class MainWindow(QWidget):
             settings,
             output,
             kind=kind,
+            clip_polygon=self.clip_polygon,
             parent=self,
         )
         self.worker.progressed.connect(self._on_progress)
@@ -531,9 +586,25 @@ class MainWindow(QWidget):
         super().closeEvent(event)
 
 
+def _quiet_chromium() -> None:
+    """Baixa a verbosidade do Chromium embutido no QtWebEngine.
+
+    Ele reclama de interfaces do Windows que a placa nao expoe, por exemplo
+    `IDCompositionDevice4`. Sao sondagens de capacidade: o Chromium tenta o
+    caminho mais rapido, nao encontra, e usa o proximo. A pagina desenha igual,
+    mas o texto assusta e nao ha nada a fazer a respeito.
+
+    Respeita a variavel se o usuario ja tiver definido a dele.
+    """
+    if os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"):
+        return
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--log-level=3"
+
+
 def run(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="  %(levelname)s %(name)s: %(message)s")
     config.ensure_dirs()
+    _quiet_chromium()
     # Precisa vir antes de existir qualquer widget OpenGL.
     configure_surface_format()
     app = QApplication(argv if argv is not None else sys.argv)

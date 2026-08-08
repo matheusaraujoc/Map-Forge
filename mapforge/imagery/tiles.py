@@ -300,6 +300,18 @@ def download_mosaic(
 
     if zoom is not None:
         zoom = min(zoom, provider.max_zoom)
+        if probe:
+            # Mesmo pedido a mao, o zoom precisa ter cobertura: sem esta
+            # verificacao o mosaico vira o retangulo cinza de "sem imagem" e
+            # tudo a jusante interpreta aquilo como superficie clara.
+            real = probe_zoom(bbox, provider, zoom)
+            if real < zoom:
+                log.warning(
+                    "Zoom %d sem cobertura em %s; usando z%d", zoom, provider.name, real
+                )
+                if progress:
+                    progress(f"z{zoom} sem cobertura, usando z{real}", 0.02)
+                zoom = real
     elif probe:
         # Sonda a cobertura real: o zoom maximo do provedor nem sempre existe
         # para a regiao, e um placeholder cinza passaria despercebido.

@@ -11,6 +11,9 @@ matplotlib>=3.7
 # Imagem de satelite (mosaico de tiles e texturas)
 pillow>=10.0
 
+# Consulta ao Overture Maps (GeoParquet na nuvem, filtrado por bbox)
+duckdb>=1.0
+
 # Interface grafica (o mapa de selecao usa QtWebEngine, que vem no PySide6-Addons)
 PySide6>=6.5
 

@@ -64,6 +64,7 @@ class GenerationWorker(QThread):
         output: Path,
         kind: str = "generate",
         render_camera: Optional[dict] = None,
+        clip_polygon=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -72,6 +73,7 @@ class GenerationWorker(QThread):
         self.output = output
         self.kind = kind
         self.render_camera = render_camera or {}
+        self.clip_polygon = clip_polygon
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -102,9 +104,19 @@ class GenerationWorker(QThread):
         from ..pipeline import load_map
         from ..preview import render_preview
 
+        from ..core.geo import LocalProjection
+        from ..pipeline import polygon_to_local
+
         started = time.perf_counter()
+        clip = (
+            polygon_to_local(self.clip_polygon, LocalProjection.for_bbox(self.bbox))
+            if self.clip_polygon
+            else None
+        )
         with Cache() as cache:
-            map_data, _ = load_map(self.bbox, cache, progress=self._progress)
+            map_data, _ = load_map(
+                self.bbox, cache, progress=self._progress, clip_area=clip
+            )
 
         self._progress("desenhando planta 2D", 0.85)
         path = self.output.with_suffix(".png")
@@ -132,6 +144,7 @@ class GenerationWorker(QThread):
                 output=self.output,
                 cache=cache,
                 progress=self._progress,
+                clip_polygon=self.clip_polygon,
             )
 
         # Sem render offscreen aqui: quem mostra o resultado e o viewport, que

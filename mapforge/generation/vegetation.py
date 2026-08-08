@@ -22,6 +22,10 @@ log = logging.getLogger(__name__)
 # Espacamento base (m) por tipo de area verde, antes do ajuste de detalhe/densidade.
 SPACING = {"forest": 0.78, "park": 1.7}
 
+# Area minima de uma mancha para receber arvore: o tamanho de uma copa, nao o do
+# espacamento. Um canto de quintal de 20 m2 tem uma mangueira.
+MIN_PATCH_M2 = 18.0
+
 # Mistura de especies por contexto, e a faixa de altura de cada uma (metros).
 # Bosque tem mais conifera e nenhuma palmeira de calcada; parque urbano tem
 # copa larga e alguma palmeira; rua tem arvore podada, mais baixa.
@@ -179,23 +183,71 @@ class TreePrototypes:
 
 
 def _scatter(poly: Polygon, spacing: float, rng: np.random.Generator) -> np.ndarray:
-    """Grade jitterada recortada pelo poligono. Retorna array (n, 2)."""
+    """Distribui pontos dentro do poligono. Retorna array (n, 2).
+
+    Grade jitterada com deslocamento grande e espacamento variando por ponto:
+    uma grade regular deixa fileiras visiveis de cima, que e o que mais denuncia
+    vegetacao gerada por computador.
+    """
     minx, miny, maxx, maxy = poly.bounds
     if maxx - minx < spacing * 0.5 or maxy - miny < spacing * 0.5:
         point = poly.representative_point()
         return np.array([[point.x, point.y]])
 
-    xs = np.arange(minx + spacing * 0.5, maxx, spacing)
-    ys = np.arange(miny + spacing * 0.5, maxy, spacing)
+    # Amostra mais denso que o alvo e depois rejeita: o excesso vira folga para
+    # o jitter forte sem abrir buracos.
+    passo = spacing * 0.8
+    xs = np.arange(minx + passo * 0.5, maxx, passo)
+    ys = np.arange(miny + passo * 0.5, maxy, passo)
     if len(xs) == 0 or len(ys) == 0:
         return np.zeros((0, 2))
 
     grid_x, grid_y = np.meshgrid(xs, ys)
     points = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-    points += rng.uniform(-spacing * 0.38, spacing * 0.38, size=points.shape)
 
-    mask = contains_xy(poly, points[:, 0], points[:, 1])
-    return points[mask]
+    # Deslocamento em cada eixo, para sumir com o alinhamento da grade. A folga
+    # encolhe em mancha pequena: com jitter fixo de 70% do passo, um quintal de
+    # 15 m jogava quase todo ponto para fora do poligono e ficava sem arvore -
+    # era o que deixava a cidade pelada mesmo com a copa toda detectada.
+    largura = min(maxx - minx, maxy - miny)
+    folga = passo * (0.7 if largura > 4 * passo else 0.3)
+    points += rng.uniform(-folga, folga, size=points.shape)
+    # E descarta parte, para a densidade nao virar textura regular.
+    points = points[rng.random(len(points)) < 0.72]
+
+    if len(points):
+        points = points[contains_xy(poly, points[:, 0], points[:, 1])]
+    if len(points):
+        return points
+
+    # Mancha pequena que perdeu todos os pontos: vale uma arvore no centro.
+    ponto = poly.representative_point()
+    return np.array([[ponto.x, ponto.y]])
+
+
+def _greenness(geo, points: np.ndarray) -> np.ndarray:
+    """Quanto de verde ha na imagem em cada ponto, de 0 a 1.
+
+    E o que faz a densidade parar de ser uniforme: dentro de um parque ha campo,
+    quadra e mata, e plantar arvore igual nos tres e o que deixa a vegetacao com
+    cara de carimbo.
+    """
+    array = geo.array
+    height, width = array.shape[:2]
+    cols, rows = [], []
+    for x, y in points:
+        c, r = geo.to_pixel(float(x), float(y))
+        cols.append(c)
+        rows.append(r)
+    cols = np.clip(np.asarray(cols), 0, width - 1).astype(np.int64)
+    rows = np.clip(np.asarray(rows), 0, height - 1).astype(np.int64)
+
+    rgb = array[rows, cols].astype(np.float64) / 255.0
+    r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    # Excesso de verde normalizado: positivo em folhagem, negativo em asfalto,
+    # telhado e solo exposto.
+    excess = 2.0 * g - r - b
+    return np.clip((excess + 0.02) / 0.16, 0.0, 1.0)
 
 
 def _as_polygons(geom):
@@ -208,6 +260,35 @@ def _as_polygons(geom):
     if hasattr(geom, "geoms"):
         return [g for g in geom.geoms if isinstance(g, Polygon)]
     return []
+
+
+# Fracao de pontos que sobrevive ao jitter e a rejeicao dentro de `_scatter`.
+SCATTER_YIELD = 0.72
+
+
+def _spacing_for_budget(map_data, base_spacing: float, max_trees: int) -> float:
+    """Fator a aplicar no espacamento para o total caber no orcamento.
+
+    Devolve 1.0 quando ja cabe. Como a contagem cai com o quadrado do
+    espacamento, o fator e a raiz da razao entre o estimado e o teto.
+    """
+    if max_trees <= 0:
+        return 1.0
+
+    estimado = 0.0
+    for kind, features in (("forest", map_data.forests), ("park", map_data.parks)):
+        passo = base_spacing * SPACING[kind]
+        if passo <= 0:
+            continue
+        area = sum(
+            f.geometry.area for f in features if f.geometry is not None and not f.geometry.is_empty
+        )
+        estimado += area / (passo * passo) * SCATTER_YIELD
+    estimado += len(map_data.trees)
+
+    if estimado <= max_trees:
+        return 1.0
+    return float(np.sqrt(estimado / max_trees))
 
 
 def generate_vegetation(
@@ -223,6 +304,22 @@ def generate_vegetation(
     settings = ctx.settings
     density = max(settings.tree_density, 0.05)
     base_spacing = ctx.detail["tree_spacing"] / density
+
+    # --- orcamento ---
+    #
+    # Com a vegetacao vindo da imagem, uma regiao de mata pode pedir dezenas de
+    # milhares de arvores. Truncar a lista no teto deixaria metade da mata pelada,
+    # entao em vez de cortar arvores no fim, afastamos todas no comeco: o
+    # espacamento cresce ate a conta fechar, e a copa cresce junto para o dossel
+    # continuar fechando. Uma mata rala de arvores grandes le como mata; meia
+    # mata cheia e meia mata vazia nao le como nada.
+    orcamento = _spacing_for_budget(map_data, base_spacing, settings.max_trees)
+    base_spacing *= orcamento
+    crown_scale = min(orcamento, 1.45)
+    if orcamento > 1.02:
+        log.info(
+            "Vegetacao: espacamento x%.2f para caber em %d arvores", orcamento, settings.max_trees
+        )
     prototypes = TreePrototypes(settings.detail)
     palette = ctx.palette
     n_canopies = palette.canopy_count()
@@ -234,8 +331,11 @@ def generate_vegetation(
         """Sorteia especie por ponto e guarda a transformacao de cada arvore."""
         if len(points) == 0:
             return
-        mix = SPECIES_MIX[context]
-        names = list(mix)
+        # A regiao inclina a mistura: palmeira no tropico, conifera no norte.
+        mix = ctx.region.species_mix(SPECIES_MIX[context])
+        names = [n for n in mix if mix[n] > 1e-6]
+        if not names:
+            return
         probs = np.array([mix[n] for n in names], dtype=float)
         probs /= probs.sum()
         chosen = rng.choice(len(names), size=len(points), p=probs)
@@ -245,7 +345,7 @@ def generate_vegetation(
         if ctx.draped:
             ground = ground + ctx.terrain.height(points[:, 0], points[:, 1])
 
-        scale = CONTEXT_SCALE[context]
+        scale = CONTEXT_SCALE[context] * (crown_scale if context != "street" else 1.0)
         for index, name in enumerate(names):
             mask = chosen == index
             if not mask.any():
@@ -269,9 +369,14 @@ def generate_vegetation(
         spacing = base_spacing * SPACING[kind]
         for feature in features:
             geom = feature.geometry
-            if geom is None or geom.is_empty or geom.area < spacing * spacing:
+            if geom is None or geom.is_empty or geom.area < MIN_PATCH_M2:
                 continue
-            if exclude is not None:
+            # A mancha vinda da imagem ja nasce recortada contra telhado, via e
+            # agua - foi assim que ela foi encontrada. Recortar de novo, agora
+            # com a folga de 1,5 m do `exclude`, corroia a borda de cada quintal
+            # e apagava a arvore que existe de verdade colada na casa.
+            detectada = feature.tags.get("source") == "deteccao"
+            if exclude is not None and not detectada:
                 try:
                     geom = geom.difference(exclude)
                 except Exception:  # noqa: BLE001 - segue com a area original
@@ -282,16 +387,30 @@ def generate_vegetation(
 
             rng = ctx.rng(feature.osm_id, int(geom.area))
             for poly in _as_polygons(geom):
-                if poly.area < spacing * spacing * 0.6:
+                # O piso e o tamanho de uma copa, nao o do espacamento. Descartar
+                # tudo que for menor que o espacamento apagava justamente a
+                # arvore de quintal - que e a maioria da vegetacao de uma cidade
+                # pequena, e que sai fatiada em cacos ao recortar contra as casas.
+                if poly.area < MIN_PATCH_M2:
                     continue
                 points = _scatter(poly, spacing, rng)
+                if len(points) and ctx.imagery is not None:
+                    # A foto decide onde ha copa de verdade: campo de futebol e
+                    # patio dentro do parque deixam de receber arvore.
+                    verde = _greenness(ctx.imagery, points)
+                    points = points[rng.random(len(points)) < verde]
                 place(points, rng, context=kind)
 
     # --- arvores mapeadas individualmente (quase sempre arborizacao de rua) ---
     if map_data.trees:
         rng = ctx.rng(7717, len(map_data.trees))
         points = np.array([[t.position.x, t.position.y] for t in map_data.trees])
-        place(points, rng, context="street")
+        if exclude is not None and not exclude.is_empty and len(points):
+            # Mesmo mapeada, arvore em cima de casa e erro de posicao no OSM.
+            livre = ~contains_xy(exclude, points[:, 0], points[:, 1])
+            points = points[livre]
+        if len(points):
+            place(points, rng, context="street")
 
     total = 0
     for species, chunks in placements.items():

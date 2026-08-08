@@ -29,18 +29,46 @@ class MapBridge(QObject):
     """Objeto exposto ao JavaScript da pagina."""
 
     selectionChanged = Signal(object)  # BBox ou None
+    polygonChanged = Signal(object)  # lista de (lat, lon) ou None
     searchRequested = Signal(str)
     pageReady = Signal()
 
     @Slot(float, float, float, float)
     def setSelection(self, south: float, west: float, north: float, east: float) -> None:
         if south == 0.0 and west == 0.0 and north == 0.0 and east == 0.0:
+            self.polygonChanged.emit(None)
             self.selectionChanged.emit(None)
             return
         try:
+            self.polygonChanged.emit(None)  # retangulo substitui o desenho
             self.selectionChanged.emit(BBox(south, west, north, east))
         except ValueError:  # retangulo degenerado (clique sem arrastar)
             self.selectionChanged.emit(None)
+
+    @Slot(list)
+    def setPolygon(self, flat: list) -> None:
+        """Contorno desenhado a mao, como lista plana [lat, lon, lat, lon, ...].
+
+        Plana porque o QWebChannel nao transporta lista de objetos do JS.
+        """
+        try:
+            valores = [float(v) for v in flat]
+        except (TypeError, ValueError):
+            return
+        if len(valores) < 6 or len(valores) % 2:
+            return
+        pontos = list(zip(valores[0::2], valores[1::2]))
+
+        lats = [p[0] for p in pontos]
+        lons = [p[1] for p in pontos]
+        try:
+            bbox = BBox(min(lats), min(lons), max(lats), max(lons))
+        except ValueError:  # contorno degenerado
+            return
+
+        self.polygonChanged.emit(pontos)
+        # A bbox continua valendo: os downloads sao sempre retangulares.
+        self.selectionChanged.emit(bbox)
 
     @Slot(str)
     def search(self, text: str) -> None:
@@ -55,6 +83,7 @@ class MapView(QWebEngineView):
     """Vista do mapa com selecao retangular."""
 
     bboxSelected = Signal(object)
+    polygonSelected = Signal(object)
     searchRequested = Signal(str)
     pageReady = Signal()
 
@@ -62,6 +91,7 @@ class MapView(QWebEngineView):
         super().__init__(parent)
         self.bridge = MapBridge(self)
         self.bridge.selectionChanged.connect(self.bboxSelected)
+        self.bridge.polygonChanged.connect(self.polygonSelected)
         self.bridge.searchRequested.connect(self.searchRequested)
         self.bridge.pageReady.connect(self.pageReady)
 

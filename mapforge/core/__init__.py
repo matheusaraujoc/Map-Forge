@@ -1,6 +1,7 @@
 from .geo import BBox, LocalProjection
 from .features import (
     Building,
+    Farmland,
     Feature,
     FeatureKind,
     Forest,
@@ -10,6 +11,8 @@ from .features import (
     Railway,
     Road,
     RoadClass,
+    Structure,
+    StructureKind,
     Tree,
     Water,
 )
@@ -26,8 +29,11 @@ __all__ = [
     "Park",
     "Parking",
     "Railway",
+    "Farmland",
     "Road",
     "RoadClass",
+    "Structure",
+    "StructureKind",
     "Tree",
     "Water",
     "Material",
