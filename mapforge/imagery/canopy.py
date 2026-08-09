@@ -166,13 +166,36 @@ def _polygonize(mask: np.ndarray, geo, cell_m: float, min_area: float) -> list[P
 
     saida = []
     for poly in getattr(juntas, "geoms", [juntas]):
-        if isinstance(poly, Polygon) and poly.area >= min_area:
-            # Simplifica na escala da celula: o contorno em escada nao ajuda em
-            # nada e multiplica os vertices.
-            limpo = poly.simplify(cell_m * 0.5, preserve_topology=True)
-            if not limpo.is_empty and limpo.area >= min_area:
-                saida.append(limpo)
+        if not isinstance(poly, Polygon) or poly.area < min_area:
+            continue
+        limpo = _arredondar(poly, lado)
+        if limpo is not None and limpo.area >= min_area:
+            saida.append(limpo)
     return saida
+
+
+def _arredondar(poly: Polygon, lado: float) -> Optional[Polygon]:
+    """Tira a escada da grade do contorno.
+
+    Uniao de celulas quadradas produz uma borda em degrau que aparece de longe
+    no modelo 3D - a mata fica com cara de mapa de bloco. Fechar e depois abrir
+    com junta redonda arredonda os cantos na escala da celula; o `simplify`
+    depois so enxuga os vertices que sobraram.
+    """
+    raio = lado * 0.9
+    try:
+        suave = poly.buffer(raio, join_style=1).buffer(-2 * raio, join_style=1)
+        suave = suave.buffer(raio, join_style=1)
+    except Exception:  # noqa: BLE001 - topologia ruim
+        suave = poly
+    if suave.is_empty:
+        return None
+    if suave.geom_type == "MultiPolygon":
+        suave = max(suave.geoms, key=lambda g: g.area)
+    if not isinstance(suave, Polygon):
+        return None
+    enxuto = suave.simplify(lado * 0.35, preserve_topology=True)
+    return enxuto if not enxuto.is_empty else None
 
 
 def detect_canopy(

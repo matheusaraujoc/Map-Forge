@@ -27,7 +27,7 @@ from .context import GenerationContext
 log = logging.getLogger(__name__)
 
 # Passo da malha do terreno (metros) por nivel de detalhe.
-GRID_STEP = {"low": 18.0, "medium": 10.0, "high": 6.0}
+GRID_STEP = {"distante": 32.0, "low": 18.0, "medium": 10.0, "high": 6.0}
 
 # Teto de celulas da grade, independente do nivel de detalhe. Sem ele, uma
 # regiao de 11 km2 em detalhe alto pedia 615 mil triangulos so de terreno e a
@@ -134,22 +134,67 @@ class TerrainField:
 
     # ------------------------------------------------------------------ escavar
 
-    def carve(self, geometry, depth: float, level: Optional[float] = None) -> None:
-        """Rebaixa os vertices da grade dentro de um poligono.
+    def carve(
+        self,
+        geometry,
+        depth: float,
+        level: Optional[float] = None,
+        bank_m: Optional[float] = None,
+    ) -> None:
+        """Rebaixa o terreno dentro de um poligono, com margem em rampa.
 
         E assim que o leito do rio aparece: o proprio terreno afunda, em vez de
         a agua ficar por cima do relevo.
+
+        A primeira versao testava apenas *dentro ou fora* em cada vertice da
+        grade. Como a grade tem 10 m no detalhe medio, a margem de um rio
+        meandrante saia em **escada de 10 m** - o contorno da agua e curvo, mas
+        o terreno em volta so sabia descer em degraus alinhados a grade.
+
+        A correcao e trocar o teste binario por distancia: o vertice desce
+        proporcionalmente a quanta margem ele tem para dentro. A transicao
+        passa a acompanhar o poligono e nao a grade, e a curva volta a ser
+        curva.
         """
+        import shapely
         from shapely import contains_xy
 
         if geometry is None or geometry.is_empty:
             return
         mesh_x, mesh_y = np.meshgrid(self.xs, self.ys)
-        inside = contains_xy(geometry, mesh_x.ravel(), mesh_y.ravel()).reshape(self.z.shape)
-        if not inside.any():
-            return
+        planos_x, planos_y = mesh_x.ravel(), mesh_y.ravel()
+        dentro = contains_xy(geometry, planos_x, planos_y)
+
         target = (self.level_over(geometry) if level is None else level) - depth
-        self.z[inside] = np.minimum(self.z[inside], target)
+
+        # A rampa cobre mais de uma celula de proposito: com menos que isso ela
+        # nao tem vertice onde acontecer e o degrau volta.
+        banda = bank_m if bank_m is not None else max(self.step * 1.6, 6.0)
+        try:
+            distancia = shapely.distance(
+                shapely.points(planos_x, planos_y), geometry.boundary
+            )
+        except Exception:  # noqa: BLE001 - topologia ruim: cai no teste binario
+            if dentro.any():
+                achatado = self.z.ravel()
+                achatado[dentro] = np.minimum(achatado[dentro], target)
+                self.z = achatado.reshape(self.z.shape)
+            return
+
+        # Dentro: desce cheio no miolo e menos perto da borda.
+        # Fora: ainda desce um pouco, formando o talude - e o que faz a margem
+        # encostar na agua em vez de terminar em parede.
+        peso = np.where(
+            dentro,
+            np.clip(distancia / banda, 0.0, 1.0) * 0.5 + 0.5,
+            np.clip(1.0 - distancia / banda, 0.0, 1.0) * 0.5,
+        )
+        if not np.any(peso > 0.0):
+            return
+
+        achatado = self.z.ravel().copy()
+        rebaixado = achatado * (1.0 - peso) + target * peso
+        self.z = np.minimum(achatado, rebaixado).reshape(self.z.shape)
 
     # -------------------------------------------------------------------- malha
 
@@ -186,9 +231,10 @@ class TerrainField:
 def _ground_material(ctx: GenerationContext):
     """Material do terreno.
 
-    Tres casos, do mais comum ao mais raro: cor do estilo; cor chapada amostrada
-    da imagem (padrao quando o satelite esta ligado); e a foto como textura, que
-    fica desligada por padrao porque nao combina com o resto da cena low-poly.
+    Quatro casos, do mais comum ao mais raro: cor do estilo; cor chapada
+    amostrada da imagem (padrao quando o satelite esta ligado); a textura
+    *pintada*, classe a classe, com as cores medidas na propria foto; e a foto
+    crua, que fica por ultimo porque nao combina com o resto da cena low-poly.
     """
     imagery = ctx.imagery
     if imagery is None:
@@ -198,15 +244,52 @@ def _ground_material(ctx: GenerationContext):
         return (ctx.ground_material or ctx.palette.ground), False
 
     from ..core.mesh import Material
-    from ..imagery.sampling import build_ground_texture
 
-    texture = build_ground_texture(
-        imagery,
-        brightness=ctx.settings.texture_brightness,
-        saturation=ctx.settings.texture_saturation,
-    )
+    if ctx.settings.ground_texture_mode == "foto":
+        from ..imagery.sampling import build_ground_texture
+
+        texture = build_ground_texture(
+            imagery,
+            brightness=ctx.settings.texture_brightness,
+            saturation=ctx.settings.texture_saturation,
+        )
+        name = "ground_satellite"
+    elif ctx.settings.redraw_ground:
+        # Redesenho com pincel: copa vira disco de copa, areia vira granulado.
+        # E o unico modo que tem *forma*, e nao so cor modulada por ruido.
+        from ..imagery.redraw import redraw_ground
+
+        desenhado = redraw_ground(
+            imagery,
+            ctx.map_data,
+            target_mpp=ctx.settings.texture_detail_m or 0.35,
+            seed=ctx.settings.seed,
+        )
+        ctx.painted_ground = desenhado
+        material = Material(
+            name="ground_redesenhado", color=(1.0, 1.0, 1.0), texture=desenhado.image
+        )
+        ctx.report(f"chao redesenhado: {desenhado.summary()}", 0.05)
+        return material, True
+    else:
+        from ..imagery.painted import paint_ground
+
+        pintado = paint_ground(
+            imagery,
+            ctx.map_data,
+            variation=ctx.settings.texture_variation,
+            target_mpp=ctx.settings.texture_detail_m,
+            detail=ctx.settings.texture_detail_m > 0.0,
+            seed=ctx.settings.seed,
+            grain=ctx.settings.texture_grain,
+        )
+        ctx.painted_ground = pintado
+        texture = pintado.image
+        name = "ground_pintado"
+        ctx.report(f"textura pintada: {pintado.summary()}", 0.05)
+
     # Cor base branca: no glTF ela multiplica a textura.
-    material = Material(name="ground_satellite", color=(1.0, 1.0, 1.0), texture=texture)
+    material = Material(name=name, color=(1.0, 1.0, 1.0), texture=texture)
     return material, True
 
 
@@ -363,9 +446,14 @@ def generate_landuse(builder: MeshBuilder, ctx: GenerationContext, map_data) -> 
     """Parques, bosques e estacionamentos como superficies chapadas.
 
     Quando a foto entra como textura do terreno essas manchas ja aparecem nela,
-    entao nao sao repintadas por cima.
+    entao nao sao repintadas por cima. Na textura *pintada* isso e obrigatorio,
+    nao opcional: e a sobreposicao das duas que produz o degrau duro na divisa -
+    o retalho chapado por cima de uma textura que ja tem a cor medida ali. Sao
+    25 mil triangulos em Araioses que so pioram a imagem.
     """
-    if ctx.imagery is not None and ctx.settings.ground_texture and not ctx.settings.satellite_landuse:
+    if ctx.imagery is None or not ctx.settings.ground_texture:
+        pass
+    elif ctx.settings.ground_texture_mode == "pintada" or not ctx.settings.satellite_landuse:
         return
 
     palette = ctx.palette

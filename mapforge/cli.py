@@ -82,6 +82,8 @@ def _settings_from_args(args) -> GenerationSettings:
         satellite_provider=args.provider,
         satellite_zoom=args.satellite_zoom,
         ground_texture=args.ground_texture,
+        ground_texture_mode=args.ground_texture_mode,
+        texture_variation=args.texture_variation,
         roof_blend=args.roof_blend,
         area_blend=args.area_blend,
         elevation=args.elevation,
@@ -92,7 +94,8 @@ def _settings_from_args(args) -> GenerationSettings:
         shadow_heights=args.shadow_heights,
         detect_buildings=args.detect_buildings,
         detect_vegetation=args.detect_vegetation,
-        canopy_shell=not args.no_canopy_shell,
+        canopy_shell=args.canopy_shell,
+        redraw_ground=args.redraw_ground,
         urban_scale=args.urban_scale,
     )
 
@@ -476,11 +479,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="sem janelas nas fachadas (reduz muito o tamanho do arquivo)",
     )
     gen.add_argument(
-        "--no-canopy-shell",
+        "--canopy-shell",
         action="store_true",
-        dest="no_canopy_shell",
-        help="arvore individual tambem no miolo das matas, em vez do dossel "
-        "(mais bonito de perto, bem mais pesado)",
+        dest="canopy_shell",
+        help="miolo das matas grandes vira uma superficie unica em vez de arvores "
+        "(desligado por padrao: produzia xadrez de cor e buracos na borda)",
+    )
+    gen.add_argument(
+        "--redraw-ground",
+        action="store_true",
+        dest="redraw_ground",
+        help="redesenha o chao com pincel por cobertura (copa vira disco de copa, "
+        "areia vira granulado) em vez de modular a foto com ruido; exige "
+        "--ground-texture",
     )
     gen.add_argument(
         "--preview", nargs="?", const=True, default=False, help="tambem grava a planta 2D em PNG"
@@ -519,7 +530,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sat.add_argument(
         "--ground-texture", action="store_true", dest="ground_texture",
-        help="experimental: cola a foto como textura do terreno em vez de so tirar a cor",
+        help="textura propria no terreno: classifica cada pixel e o repinta com a "
+        "cor daquela cobertura naquele lugar (nao ha padrao fixo - as cores saem "
+        "da regiao)",
+    )
+    sat.add_argument(
+        "--ground-texture-mode", dest="ground_texture_mode",
+        choices=("pintada", "foto"), default="pintada",
+        help="'pintada' (padrao) repinta por classe de cobertura; 'foto' cola a "
+        "imagem crua, que briga com a estilizacao low-poly",
+    )
+    sat.add_argument(
+        "--texture-variation", type=float, default=0.55, dest="texture_variation",
+        help="quanto da variacao interna de cada classe sobrevive na repintura "
+        "(0 = chapado, 1 = quase a foto; padrao 0.55)",
     )
     fontes = gen.add_argument_group("fontes de edificios")
     fontes.add_argument(
@@ -626,11 +650,19 @@ def build_parser() -> argparse.ArgumentParser:
     region.add_argument("--roof-blend", type=float, default=0.75, dest="roof_blend")
     region.add_argument("--area-blend", type=float, default=0.55, dest="area_blend")
     region.add_argument("--ground-texture", action="store_true", dest="ground_texture")
+    region.add_argument(
+        "--ground-texture-mode", dest="ground_texture_mode",
+        choices=("pintada", "foto"), default="pintada",
+    )
+    region.add_argument(
+        "--texture-variation", type=float, default=0.55, dest="texture_variation"
+    )
     region.add_argument("--overture", action="store_true")
     region.add_argument("--footprints", action="store_true")
     region.add_argument("--detect-buildings", action="store_true", dest="detect_buildings")
     region.add_argument("--detect-vegetation", action="store_true", dest="detect_vegetation")
-    region.add_argument("--no-canopy-shell", action="store_true", dest="no_canopy_shell")
+    region.add_argument("--canopy-shell", action="store_true", dest="canopy_shell")
+    region.add_argument("--redraw-ground", action="store_true", dest="redraw_ground")
     region.add_argument(
         "--urban-scale", dest="urban_scale", default=None,
         choices=("povoado", "pequena", "media", "grande"),

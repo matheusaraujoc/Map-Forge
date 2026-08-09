@@ -164,7 +164,10 @@ def generate(
         raw_osm=raw_osm,
         raw_overture=raw_overture,
     )
-    if map_data.is_empty():
+    if map_data.is_empty() and not settings.allow_empty:
+        # No carregamento dinamico isto e normal e nao e erro: um bloco no meio
+        # do rio ou da mata nao tem nada mapeado, e ainda assim precisa existir
+        # como chao. Quem pede a cena decide se o vazio e falha.
         raise RuntimeError(
             "nenhum dado encontrado nessa regiao - confira a bbox (sul,oeste,norte,leste)"
         )

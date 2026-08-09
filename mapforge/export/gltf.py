@@ -34,7 +34,12 @@ def _pbr(material: Material) -> trimesh.visual.material.PBRMaterial:
         "roughnessFactor": float(material.roughness),
         "doubleSided": True,
     }
-    if material.opacity < 1.0:
+    if material.alpha_cutoff is not None:
+        # MASK vem antes de BLEND: recorte nao precisa de ordenacao por
+        # profundidade, e vegetacao transparente ordenada e um pesadelo.
+        kwargs["alphaMode"] = "MASK"
+        kwargs["alphaCutoff"] = float(material.alpha_cutoff)
+    elif material.opacity < 1.0:
         kwargs["alphaMode"] = "BLEND"
     if material.emissive:
         kwargs["emissiveFactor"] = [float(c) for c in material.emissive]

@@ -332,6 +332,47 @@ def _flat_roof(
     return z
 
 
+# Beiral: o quanto o telhado avanca alem da parede.
+#
+# Telha ceramica brasileira sempre avanca - 50 a 80 cm numa casa, para jogar a
+# chuva longe da alvenaria. Sem beiral o telhado nasce exatamente no plano da
+# parede e a casa fica com cara de caixa com tampa: some a linha de sombra que
+# separa cobertura de fachada, que e justamente o que o olho usa para ler "casa".
+EAVE_M = 0.55
+EAVE_MAX_FRACTION = 0.06  # nao mais que isto do lado menor do predio
+FASCIA_M = 0.16  # espessura da testeira, para o telhado nao ser papel
+
+
+def _with_eave(poly: Polygon, area: float) -> tuple[Polygon, float]:
+    """Contorno do telhado com beiral. Devolve (poligono, avanco aplicado).
+
+    `join_style=2` pelo mesmo motivo do embasamento: junta redonda transforma
+    cada canto em 16 vertices e o beiral passaria a custar mais que o telhado.
+    """
+    lado = math.sqrt(max(area, 1.0))
+    avanco = min(EAVE_M, lado * EAVE_MAX_FRACTION)
+    if avanco < 0.12:
+        return poly, 0.0
+    try:
+        maior = poly.buffer(avanco, join_style=2)
+    except Exception:  # noqa: BLE001 - topologia ruim
+        return poly, 0.0
+    if maior.is_empty or not isinstance(maior, Polygon):
+        return poly, 0.0
+    return maior, avanco
+
+
+def _add_fascia(
+    builder: MeshBuilder, poly: Polygon, z: float, material: Material
+) -> None:
+    """Testeira: a faixa vertical na ponta do beiral.
+
+    Sem ela o telhado tem espessura zero e, visto de baixo ou de lado, aparece
+    como uma folha - o que denuncia a geometria na hora.
+    """
+    builder.add_walls(material, poly, z - FASCIA_M, z)
+
+
 def _hip_roof(
     builder: MeshBuilder,
     poly: Polygon,
@@ -520,11 +561,24 @@ def _add_plinth(
     base_z: float,
     material: Material,
 ) -> None:
-    """Embasamento: faixa saliente rente ao chao, como tem quase toda casa."""
-    skirt = poly.buffer(0.18)
+    """Embasamento: faixa saliente rente ao chao, como tem quase toda casa.
+
+    `join_style=2` (esquadria) e o detalhe que importa aqui: com a junta redonda
+    padrao, cada canto do contorno vira 16 vertices, e o embasamento - uma faixa
+    de 18 cm - passava a custar 215 mil triangulos em Araioses, 41% da cena
+    inteira e oito vezes o que custavam todos os predios. Em esquadria o
+    embasamento tem exatamente os cantos do predio, e a 18 cm ninguem ve a
+    diferenca entre um canto redondo e um canto vivo.
+    """
+    skirt = poly.buffer(0.18, join_style=2)
     if skirt.is_empty or not isinstance(skirt, Polygon):
         return
-    builder.add_prism(material, skirt, base_z, base_z + 0.45, cap_top=True)
+    # `cap_top=False`: o embasamento e uma faixa de 18 cm em volta da parede, e
+    # o predio se apoia nele. Tampar o topo desenha uma **laje macica do tamanho
+    # do contorno inteiro**, que fica escondida dentro do predio - medido, eram
+    # 134.588 m2 em Araioses, 100% deles debaixo de edificio, e apareciam como
+    # chapa clara sempre que a parede nao os cobria.
+    builder.add_prism(material, skirt, base_z, base_z + 0.45, cap_top=False)
 
 
 def _add_balconies(
@@ -776,22 +830,43 @@ def generate_buildings(
             tagged_pitch = levels * LEVEL_HEIGHT if levels else None
 
         roof_top = wall_top
+        # Telhado inclinado avanca alem da parede; laje e platibanda nao.
+        eave_poly, eave = (
+            _with_eave(poly, poly.area)
+            if roof in {"gable", "hip", "mansard", "skillion"}
+            and ctx.detail["roof_detail"]
+            else (poly, 0.0)
+        )
+        if eave > 0.0:
+            _add_fascia(builder, eave_poly, wall_top, roof_mat)
+
         if roof == "gable":
             pitch = tagged_pitch or min(0.42 * math.sqrt(poly.area), 4.2)
-            roof_top = _gable_roof(builder, poly, wall_top, max(1.4, pitch), roof_mat, wall_mat)
+            roof_top = _gable_roof(
+                builder, eave_poly, wall_top, max(1.4, pitch), roof_mat, wall_mat
+            )
         elif roof == "hip":
             pitch = tagged_pitch or min(0.34 * math.sqrt(poly.area), 3.6)
-            roof_top = _hip_roof(builder, poly, wall_top, max(1.2, pitch), roof_mat)
+            roof_top = _hip_roof(builder, eave_poly, wall_top, max(1.2, pitch), roof_mat)
         elif roof == "mansard":
             pitch = tagged_pitch or min(0.40 * math.sqrt(poly.area), 3.8)
-            roof_top = _mansard_roof(builder, poly, wall_top, max(1.6, pitch), roof_mat)
+            roof_top = _mansard_roof(
+                builder, eave_poly, wall_top, max(1.6, pitch), roof_mat
+            )
         elif roof == "skillion":
             pitch = tagged_pitch or min(0.30 * math.sqrt(poly.area), 3.0)
             roof_top = _skillion_roof(
-                builder, poly, wall_top, max(1.0, pitch), roof_mat, wall_mat, rng
+                builder, eave_poly, wall_top, max(1.0, pitch), roof_mat, wall_mat, rng
             )
         else:
-            parapet = poly.area > 120 and height > 7.0
+            # Platibanda: a murada que esconde a laje. No Brasil ela nao e so de
+            # predio grande - comercio de rua de 60 m2 tem platibanda com o nome
+            # da loja, e e ela que da a silhueta reta da rua comercial.
+            comercio = building.building_type in {
+                "commercial", "retail", "supermarket", "office",
+                "industrial", "warehouse",
+            }
+            parapet = (poly.area > 120 and height > 7.0) or (comercio and poly.area > 40)
             roof_top = _flat_roof(builder, ctx, poly, wall_top, roof_mat, wall_mat, parapet)
 
         if do_windows and poly.area >= 30:

@@ -28,6 +28,31 @@ WATERWAY_WIDTH = {
     "drain": 2.2,
 }
 
+# Canal e vala sao obra: margem reta, sem meandro. Suavizar o eixo deles produz
+# uma curva que nao existe no terreno.
+STRAIGHT_WATERWAYS = {"canal", "ditch", "drain"}
+
+# Fundura relativa por tipo. Corrego e raso e deixa o leito aparecer; rio e
+# fundo e a lamina esconde o fundo.
+DEPTH_FACTOR = {
+    "river": 1.0,
+    "canal": 0.85,
+    "stream": 0.45,
+    "ditch": 0.35,
+    "drain": 0.35,
+}
+
+
+def _is_dry(feature) -> bool:
+    """Curso intermitente: no semiarido brasileiro e a maioria.
+
+    `intermittent=yes` significa leito seco a maior parte do ano. Pintar de azul
+    um rio que so tem agua na cheia e erro grosseiro de leitura da paisagem -
+    o que se ve de cima e areia.
+    """
+    tags = getattr(feature, "tags", {}) or {}
+    return tags.get("intermittent") == "yes" or tags.get("seasonal") == "yes"
+
 
 def generate_water(builder: MeshBuilder, ctx: GenerationContext, waters, rivers):
     """Desenha o canal e devolve a uniao usada para recortar o terreno."""
@@ -35,9 +60,18 @@ def generate_water(builder: MeshBuilder, ctx: GenerationContext, waters, rivers)
         return None
 
     parts = []
+    secos = []  # leitos intermitentes: areia, nao agua
+    # osm_id -> geometria, para casar cada corpo com a cor amostrada nele.
+    por_id: dict[int, object] = {}
+
     for water in waters:
-        if water.geometry is not None and not water.geometry.is_empty:
-            parts.append(water.geometry)
+        if water.geometry is None or water.geometry.is_empty:
+            continue
+        if _is_dry(water):
+            secos.append(water.geometry)
+            continue
+        parts.append(water.geometry)
+        por_id[water.osm_id] = water.geometry
 
     segments = max(ctx.detail["buffer_segments"], 2)
     detail = ctx.settings.detail
@@ -45,11 +79,29 @@ def generate_water(builder: MeshBuilder, ctx: GenerationContext, waters, rivers)
         line = river.centerline
         if line is None or line.length < 2.0:
             continue
-        line = smooth_river(line, detail)
-        width = river.width or WATERWAY_WIDTH.get(river.tags.get("waterway", ""), 4.0)
-        parts.append(
-            line.buffer(max(width, 1.5) / 2.0, quad_segs=segments, cap_style=1, join_style=1)
+        tipo = river.tags.get("waterway", "")
+        # Canal nao meandra: e vala escavada em linha reta.
+        if tipo not in STRAIGHT_WATERWAYS:
+            line = smooth_river(line, detail)
+        width = river.width or WATERWAY_WIDTH.get(tipo, 4.0)
+        faixa = line.buffer(
+            max(width, 1.5) / 2.0, quad_segs=segments, cap_style=1, join_style=1
         )
+        if _is_dry(river):
+            secos.append(faixa)
+            continue
+        parts.append(faixa)
+        por_id[river.osm_id] = faixa
+
+    # O leito seco entra como solo exposto, no nivel do chao: sem lamina, sem
+    # escavacao profunda, so a marca clara do talvegue.
+    if secos:
+        leito = ctx.simplify(unary_union(secos), factor=0.3)
+        if not leito.is_empty:
+            builder.add_flat(
+                ctx.palette.dirt, leito, layers.Z_GROUND + 0.01, drape=ctx.draped
+            )
+            log.info("Leitos intermitentes: %.2f ha secos", leito.area / 1e4)
 
     if not parts:
         return None
@@ -64,7 +116,7 @@ def generate_water(builder: MeshBuilder, ctx: GenerationContext, waters, rivers)
         # Com relevo, quem escava o canal e o proprio terreno: cada corpo d'agua
         # rebaixa a grade para o seu nivel e a lamina fica plana por cima. Talude
         # e leito separados nao fazem falta - o DEM ja da a forma do vale.
-        return _generate_water_on_terrain(builder, ctx, merged)
+        return _generate_water_on_terrain(builder, ctx, merged, por_id)
 
     bank_width = layers.BANK_WIDTH
 
@@ -102,12 +154,36 @@ def generate_water(builder: MeshBuilder, ctx: GenerationContext, waters, rivers)
 
     builder.add_flat(palette.water_bed, bed, layers.Z_WATER_BED)
     # A lamina cobre o canal inteiro e encosta no talude, como agua de verdade.
-    builder.add_flat(palette.water, merged, layers.Z_WATER)
+    builder.add_flat(_material_for(ctx, merged, por_id), merged, layers.Z_WATER)
 
     return merged
 
 
-def _generate_water_on_terrain(builder: MeshBuilder, ctx: GenerationContext, merged):
+def _material_for(ctx, body, por_id):
+    """Material amostrado do corpo d'agua que cai dentro deste pedaco.
+
+    Depois da uniao, os corpos perdem o osm_id: o que sobra e um MultiPolygon.
+    A associacao volta pelo ponto interno de cada geometria original - basta um
+    acerto para o pedaco herdar a cor medida naquele rio.
+    """
+    materiais = getattr(ctx, "water_materials", None)
+    if not materiais:
+        return ctx.palette.water
+    for osm_id, geom in por_id.items():
+        material = materiais.get(osm_id)
+        if material is None or geom is None or geom.is_empty:
+            continue
+        try:
+            if body.contains(geom.representative_point()):
+                return material
+        except Exception:  # noqa: BLE001 - topologia ruim
+            continue
+    return ctx.palette.water
+
+
+def _generate_water_on_terrain(
+    builder: MeshBuilder, ctx: GenerationContext, merged, por_id=None
+):
     """Agua sobre relevo: escava a grade e poe uma lamina plana por corpo d'agua.
 
     Cada corpo tem o seu nivel, tirado do percentil baixo das alturas sob ele -
@@ -116,7 +192,7 @@ def _generate_water_on_terrain(builder: MeshBuilder, ctx: GenerationContext, mer
     from shapely.geometry import MultiPolygon, Polygon
 
     terrain = ctx.terrain
-    palette = ctx.palette
+    por_id = por_id or {}
 
     if isinstance(merged, Polygon):
         bodies = [merged]
@@ -131,6 +207,6 @@ def _generate_water_on_terrain(builder: MeshBuilder, ctx: GenerationContext, mer
             continue
         level = terrain.level_over(body, percentile=15.0)
         terrain.carve(body, depth=depth, level=level)
-        builder.add_flat(palette.water, body, level + layers.Z_WATER)
+        builder.add_flat(_material_for(ctx, body, por_id), body, level + layers.Z_WATER)
 
     return merged

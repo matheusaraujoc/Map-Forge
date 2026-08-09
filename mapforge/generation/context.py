@@ -10,10 +10,24 @@ import numpy as np
 from ..core.geo import BBox, LocalProjection
 from ..styles import Palette, Style, get_style
 
-DETAIL_LEVELS = ("low", "medium", "high")
+DETAIL_LEVELS = ("distante", "low", "medium", "high")
 
 # Multiplicadores por nivel de detalhe.
 _DETAIL_PRESETS: dict[str, dict[str, Any]] = {
+    # Nivel mais barato, para bloco distante no carregamento dinamico: sem
+    # calcada elevada, sem mobiliario, predio como volume.
+    "distante": {
+        "buffer_segments": 1,
+        "windows": False,
+        "tree_spacing": 34.0,
+        "simplify": 2.5,
+        "min_building_area": 40.0,
+        "roof_detail": False,
+        "road_markings": False,
+        "building_detail": False,
+        "street_furniture": False,
+        "curb_walls": False,
+    },
     "low": {
         "buffer_segments": 1,
         "windows": False,
@@ -24,6 +38,9 @@ _DETAIL_PRESETS: dict[str, dict[str, Any]] = {
         "road_markings": False,
         "building_detail": False,
         "street_furniture": False,
+        # O degrau do meio-fio tem 12 cm e some a poucos metros; as paredes
+        # verticais dele custam mais que todos os predios juntos.
+        "curb_walls": False,
     },
     "medium": {
         "buffer_segments": 2,
@@ -35,6 +52,7 @@ _DETAIL_PRESETS: dict[str, dict[str, Any]] = {
         "road_markings": True,
         "building_detail": True,
         "street_furniture": True,
+        "curb_walls": False,
     },
     "high": {
         "buffer_segments": 4,
@@ -46,6 +64,7 @@ _DETAIL_PRESETS: dict[str, dict[str, Any]] = {
         "road_markings": True,
         "building_detail": True,
         "street_furniture": True,
+        "curb_walls": True,
     },
 }
 
@@ -62,6 +81,9 @@ class GenerationSettings:
     # Forca o porte do assentamento ('povoado', 'pequena', 'media', 'grande')
     # em vez de medi-lo nos contornos. None = medir.
     urban_scale: Optional[str] = None
+    # Regiao sem nada mapeado gera so o terreno em vez de levantar erro. E o que
+    # o carregamento dinamico precisa: bloco no meio do rio tambem existe.
+    allow_empty: bool = False
 
     terrain: bool = True
     roads: bool = True
@@ -91,6 +113,18 @@ class GenerationSettings:
     roof_palette_size: int = 24
     texture_brightness: float = 1.04
     texture_saturation: float = 0.92
+    # Como a textura do terreno e feita quando `ground_texture` esta ligado:
+    # 'pintada' repinta cada classe de cobertura com a cor medida na foto;
+    # 'foto' cola a foto crua, que e o modo antigo.
+    ground_texture_mode: str = "pintada"
+    # Quanto da variacao interna de cada classe sobrevive na repintura.
+    texture_variation: float = 0.55
+    # Resolucao alvo da textura pintada, em metros por pixel. A foto tem ~1,2
+    # m/px e esta borrada; a banda que falta e preenchida com o grao procedural
+    # de cada cobertura. 0 desliga o detalhe e mantem so a cor macro.
+    texture_detail_m: float = 0.35
+    # Multiplicador do grao. 0 = so a cor macro, 1 = calibrado, 2 = exagerado.
+    texture_grain: float = 1.0
 
     # --- fontes extras de edificios ---
     # Overture Maps: conflacao OSM + Microsoft + Esri + Google Open Buildings,
@@ -111,9 +145,19 @@ class GenerationSettings:
     # desenha mata em cidade pequena. Exige satellite=True.
     detect_vegetation: bool = False
     # O miolo das matas grandes vira uma superficie ondulada unica em vez de
-    # milhares de arvores. Desligue para ter arvore individual em toda parte -
-    # fica mais bonito de perto e muito mais pesado.
-    canopy_shell: bool = True
+    # arvores individuais.
+    #
+    # **Desligado por padrao.** A economia media (10% da cena) nao pagou os
+    # defeitos: a cor por celula de 8 m produzia um xadrez verde que nao existe
+    # em mata nenhuma, o afunilamento da borda dobrava a superficie e abria
+    # buracos escuros, e o miolo ficava vazio justamente onde ha arvore de
+    # verdade. Arvore individual com o prototipo barato custa 10% a mais e nao
+    # tem nenhum desses problemas.
+    canopy_shell: bool = False
+    # Redesenha a textura do chao com pincel por cobertura em vez de so modular
+    # ruido: copa vira disco de copa, areia vira granulado, capim vira traco.
+    # As cores saem da propria foto; o que muda e a *estrutura* do desenho.
+    redraw_ground: bool = False
 
     # --- relevo ---
     elevation: bool = False
@@ -174,8 +218,17 @@ class GenerationContext:
 
         # Imagem de satelite georreferenciada (GeoImage) e o que dela deriva.
         self.imagery = imagery
+        # MapData da cena, preenchido em `build_scene`: o classificador de
+        # cobertura usa o mapa vetorial para saber onde ha via e agua.
+        self.map_data = None
+        # Resultado da textura pintada, quando ela e gerada.
+        self.painted_ground = None
         self.roof_materials: dict[int, object] = {}
         self.area_materials: dict[str, dict[int, object]] = {}
+        # Cor real de cada corpo d'agua: no Brasil o rio nunca e "azul".
+        self.water_materials: dict[int, object] = {}
+        # Cor real de cada tipo de pavimento, por chave de superficie.
+        self.road_materials: dict[str, object] = {}
         self.ground_material = None
         # Alturas medidas pela sombra na imagem (osm_id -> metros).
         self.shadow_heights: dict[int, float] = {}

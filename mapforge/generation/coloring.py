@@ -111,6 +111,133 @@ def build_area_materials(ctx, map_data) -> dict[str, dict[int, Material]]:
     }
 
 
+def build_water_materials(ctx, waters, rivers) -> dict[int, Material]:
+    """Cor real de cada corpo d'agua.
+
+    No Brasil isso nao e detalhe: o Negro e preto de tanino, o Solimoes e barro,
+    o Parnaiba e esverdeado de sedimento, uma lagoa costeira e quase turquesa.
+    Pintar tudo com o mesmo azul de estilo e o que mais denuncia o mapa como
+    desenho - e a foto sabe a resposta em cada ponto.
+
+    Amostra com recuo para dentro, para nao pegar a margem, e por baixo de uma
+    faixa de saturacao menor que a das areas verdes: agua realcada demais vira
+    piscina.
+    """
+    from ..imagery.sampling import harmonize, sample_area_color
+
+    imagery = ctx.imagery
+    if imagery is None:
+        return {}
+
+    palette = ctx.palette
+    amostras: dict[int, tuple[float, float, float]] = {}
+
+    for water in waters:
+        cor = sample_area_color(imagery, getattr(water, "geometry", None), inset=3.0)
+        if cor is not None:
+            amostras[water.osm_id] = harmonize(cor, saturation=1.05)
+
+    for river in rivers:
+        linha = getattr(river, "centerline", None)
+        if linha is None or linha.is_empty:
+            continue
+        largura = max(river.width or 8.0, 4.0)
+        # Faixa estreita no eixo: a borda do rio tem margem, banco de areia e
+        # sombra de mata, que puxariam a cor para longe da agua.
+        faixa = linha.buffer(largura * 0.3)
+        cor = sample_area_color(imagery, faixa)
+        if cor is not None:
+            amostras[river.osm_id] = harmonize(cor, saturation=1.05)
+
+    if not amostras:
+        return {}
+
+    ids = list(amostras)
+    labels, centers = quantize(
+        np.array([amostras[i] for i in ids]), 5, seed=ctx.settings.seed
+    )
+    amount = ctx.settings.area_blend
+    materiais = [
+        Material(
+            name=f"water_sat_{i:02d}",
+            color=blend(palette.style.water, tuple(float(c) for c in centro), amount),
+            # Os mesmos parametros do material de agua do estilo: sem eles a agua
+            # amostrada perderia o brilho e a transparencia e viraria chapa azul.
+            roughness=0.15,
+            metallic=0.1,
+            opacity=palette.style.water_opacity,
+        )
+        for i, centro in enumerate(centers)
+    ]
+    log.info("Agua: %d corpos em %d cores", len(amostras), len(centers))
+    return {osm_id: materiais[labels[n]] for n, osm_id in enumerate(ids)}
+
+
+def build_road_materials(ctx, roads) -> dict[str, Material]:
+    """Cor real de cada tipo de pavimento, medida na foto.
+
+    O cinza de tabela nao existe na rua: asfalto novo e quase preto, asfalto
+    gasto de cidade pequena e cinza-claro puxado para o marrom da poeira, e via
+    de terra tem a cor do solo *daquele lugar* - vermelha no oeste paulista,
+    clara no litoral, cinza no basalto. Uma cor por classe de superficie, medida
+    onde a classe realmente aparece.
+
+    E uma cor por classe, nao por via: as vias sao unidas por classe antes de
+    virar geometria, entao cor por via exigiria desfazer a uniao - troca cara
+    por um ganho que, a esta distancia, ninguem percebe.
+    """
+    from ..imagery.sampling import harmonize, sample_area_color
+
+    from .roads import road_half_width, road_surface_key
+
+    imagery = ctx.imagery
+    if imagery is None or not roads:
+        return {}
+
+    palette = ctx.palette
+    por_classe: dict[str, list] = {}
+    for road in roads:
+        linha = getattr(road, "centerline", None)
+        if linha is None or linha.is_empty or linha.length < 12.0:
+            continue
+        por_classe.setdefault(road_surface_key(road), []).append(
+            (linha, road_half_width(road))
+        )
+
+    padrao = {
+        "major": palette.style.asphalt_major,
+        "road": palette.style.asphalt,
+        "foot": palette.style.footway,
+        "cobble": palette.cobble.color,
+        "dirt": palette.dirt.color,
+    }
+
+    saida: dict[str, Material] = {}
+    for chave, itens in por_classe.items():
+        amostras = []
+        # Faixa estreita no eixo: a borda da via pega meio-fio, calcada e sombra.
+        for linha, meia in sorted(itens, key=lambda it: -it[0].length)[:40]:
+            cor = sample_area_color(imagery, linha.buffer(max(meia * 0.45, 0.8)))
+            if cor is not None:
+                amostras.append(cor)
+        if len(amostras) < 3:
+            continue
+        media = tuple(float(c) for c in np.median(np.array(amostras), axis=0))
+        base = padrao.get(chave)
+        if base is None:
+            continue
+        saida[chave] = Material(
+            name=f"{chave}_sat",
+            # Saturacao baixa: pavimento realcado vira pista de corrida.
+            color=blend(base, harmonize(media, saturation=0.95), ctx.settings.area_blend),
+            roughness=palette.style.roughness,
+        )
+
+    if saida:
+        log.info("Pavimento: %s medidos na foto", ", ".join(sorted(saida)))
+    return saida
+
+
 def build_ground_color(ctx) -> Material | None:
     """Cor de fundo do terreno: mediana da imagem inteira.
 

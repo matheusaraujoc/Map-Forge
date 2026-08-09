@@ -30,6 +30,11 @@ class Material:
     roughness: float = 0.9
     metallic: float = 0.0
     opacity: float = 1.0
+    # Recorte por alfa. Quando definido, o material vira `alphaMode: MASK` com
+    # este corte - o pixel some abaixo do limiar em vez de ficar semitransparente.
+    # E **nucleo do glTF 2.0**, nao extensao: funciona em qualquer visualizador,
+    # que e o que torna o impostor de arvore portavel.
+    alpha_cutoff: float | None = None
     emissive: tuple[float, float, float] | None = None
     # Imagem PIL opcional (textura de cor base). Fora de __eq__/__hash__ porque
     # imagem nao e hashavel e a identidade do material e o nome.

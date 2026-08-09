@@ -82,6 +82,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MapForge - gerador de cidades 3D a partir do OpenStreetMap")
+        # Tamanho de quando o usuario restaura a janela; a abertura e maximizada.
         self.resize(1500, 940)
 
         self.bbox: Optional[BBox] = None
@@ -231,12 +232,31 @@ class MainWindow(QWidget):
         self.area_blend.setEnabled(False)
         sat_form.addRow("Peso nas areas e no terreno", self.area_blend)
 
-        self.ground_texture = QCheckBox("Colar a foto como textura do terreno (experimental)")
+        self.ground_texture = QCheckBox("Textura propria no terreno (pintada da foto)")
+        self.redraw_ground = QCheckBox("Redesenhar o chao com pincel (experimental)")
+        self.redraw_ground.setToolTip(
+            "Em vez de modular a foto com ruido, *redesenha* cada cobertura com o\n"
+            "padrao dela: mata vira disco de copa com sombra, areia vira\n"
+            "granulado, capim vira traco curto.\n\n"
+            "As cores nao sao inventadas - saem dos percentis da propria classe\n"
+            "na foto. O desenho e feito direto na resolucao alvo, entao nao\n"
+            "herda o borrao da imagem de satelite.\n\n"
+            "Depende de 'Textura propria no terreno' estar marcado."
+        )
+        self.redraw_ground.setEnabled(False)
+
         self.ground_texture.setToolTip(
-            "Desligado por padrao: a foto crua costuma brigar com a leitura low-poly."
+            "Classifica cada pixel da foto e o repinta com a cor daquela cobertura\n"
+            "naquele lugar: a mata recebe o verde da mata dali, o solo o ocre do\n"
+            "solo dali. Nao ha padrao fixo - as cores saem da regiao.\n\n"
+            "Some com o retalho chapado por poligono, que deixava o chao com cara\n"
+            "de mapa de bloco. O que a malha ja desenha em 3D (telhado, rua, agua)\n"
+            "nao entra na textura: herda a cobertura vizinha."
         )
         self.ground_texture.setEnabled(False)
         sat_form.addRow(self.ground_texture)
+        sat_form.addRow(self.redraw_ground)
+        self.ground_texture.toggled.connect(self.redraw_ground.setEnabled)
         form_layout.addWidget(sat_box)
 
         # --- fontes de edificios ---
@@ -469,6 +489,7 @@ class MainWindow(QWidget):
             shadow_heights=self.shadow_heights.isChecked(),
             detect_buildings=self.detect_buildings.isChecked(),
             detect_vegetation=self.detect_vegetation.isChecked(),
+            redraw_ground=self.redraw_ground.isChecked(),
         )
 
     def _start(self, kind: str) -> None:
@@ -610,5 +631,8 @@ def run(argv: Optional[list[str]] = None) -> int:
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("MapForge")
     window = MainWindow()
-    window.show()
+    # Janela maximizada, nao tela cheia sem moldura: o mapa de selecao e o
+    # viewport 3D ganham o espaco todo, e a barra de titulo continua ali para
+    # mover e redimensionar.
+    window.showMaximized()
     return app.exec()

@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
+import shapely
 from shapely import contains_xy
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
@@ -144,6 +145,23 @@ def _palm(fronds: int, trunk_top: float):
     return np.concatenate(verts), np.concatenate(faces)
 
 
+# Sobreposicao minima entre o fundo da copa e o topo do tronco, em fracao da
+# altura da arvore. Encostar exatamente deixa uma linha de luz na juncao.
+CANOPY_OVERLAP = 0.04
+
+
+def _anchor_canopy(canopy, trunk_top: float, overlap: float = CANOPY_OVERLAP):
+    """Desce a copa ate ela alcancar o tronco, se estiver flutuando."""
+    verts, faces = canopy
+    fundo = float(np.asarray(verts)[:, 2].min())
+    folga = fundo - (trunk_top - overlap)
+    if folga <= 0.0:
+        return canopy
+    baixados = np.asarray(verts, dtype=np.float64).copy()
+    baixados[:, 2] -= folga
+    return baixados, faces
+
+
 class TreePrototypes:
     """Prototipos normalizados: altura total = 1.0 unidade.
 
@@ -151,36 +169,84 @@ class TreePrototypes:
     tronco muda muito: palmeira e quase so estipe, arbusto quase nao tem.
     """
 
-    def __init__(self, detail_level: str):
+    def __init__(self, detail_level: str, trunk_sides: int | None = None):
         subdivisions = 0 if detail_level == "low" else 1
         sides = 5 if detail_level == "low" else 6
+        tronco_lados = trunk_sides or sides
 
+        lados = tronco_lados
         self.trunks = {
-            "broadleaf": _ngon(sides, 0.055, 0.0, 0.45),
-            "conifer": _ngon(sides, 0.050, 0.0, 0.30),
-            "pine": _ngon(sides, 0.048, 0.0, 0.34),
-            "cypress": _ngon(sides, 0.040, 0.0, 0.18),
-            "palm": _ngon(sides, 0.042, 0.0, 0.74),
-            "umbrella": _ngon(sides, 0.060, 0.0, 0.56),
-            "shrub": _ngon(max(sides - 1, 4), 0.035, 0.0, 0.12),
+            "broadleaf": _ngon(lados, 0.055, 0.0, 0.45),
+            "conifer": _ngon(lados, 0.050, 0.0, 0.30),
+            "pine": _ngon(lados, 0.048, 0.0, 0.34),
+            "cypress": _ngon(lados, 0.040, 0.0, 0.18),
+            "palm": _ngon(lados, 0.042, 0.0, 0.74),
+            "umbrella": _ngon(lados, 0.060, 0.0, 0.56),
+            "shrub": _ngon(max(lados - 1, 3), 0.035, 0.0, 0.12),
         }
-        self.canopies = {
-            "broadleaf": _blob(subdivisions, 0.30, 0.66),
-            "conifer": _cone(sides + 1, 0.26, 0.28, 1.0),
-            "pine": _stacked_cones(sides + 1, 3 if detail_level != "low" else 2, 0.30, 0.30, 1.0),
+        # Variantes por especie. Uma copa so por especie deixa a mata com cara de
+        # carimbo: mil arvores identicas giradas. Duas ou tres silhuetas por
+        # especie custam zero - continuam instanciadas - e quebram a repeticao,
+        # que e o que mais denuncia vegetacao gerada por computador.
+        self.canopies: dict[str, list] = {
+            "broadleaf": [
+                _blob(subdivisions, 0.30, 0.66),
+                # Copa mais larga e baixa: mangueira, oiti, arvore de calcada
+                # podada em taca.
+                _flattened_blob(subdivisions, 0.34, 0.62, 0.78),
+                # Copa alta e estreita, de arvore espremida entre casas.
+                _flattened_blob(subdivisions, 0.24, 0.70, 1.35),
+            ],
+            "conifer": [
+                _cone(sides + 1, 0.26, 0.28, 1.0),
+                _cone(sides + 1, 0.22, 0.34, 1.0),
+            ],
+            "pine": [
+                _stacked_cones(sides + 1, 3 if detail_level != "low" else 2, 0.30, 0.30, 1.0),
+                _stacked_cones(sides + 1, 4 if detail_level != "low" else 2, 0.26, 0.26, 1.0),
+            ],
             # Cipreste: fuso alto e estreito.
-            "cypress": _cone(sides + 1, 0.14, 0.16, 1.0),
-            "palm": _palm(7 if detail_level != "low" else 5, 0.72),
+            "cypress": [_cone(sides + 1, 0.14, 0.16, 1.0)],
+            "palm": [
+                _palm(7 if detail_level != "low" else 5, 0.72),
+                # Palmeira de estipe mais alto e menos folhas: carnauba, babacu.
+                _palm(6 if detail_level != "low" else 4, 0.82),
+            ],
             # Copa de guarda-chuva: esfera bem achatada e larga.
-            "umbrella": _flattened_blob(subdivisions, 0.38, 0.78, 0.45),
-            "shrub": _blob(subdivisions, 0.34, 0.42),
+            "umbrella": [
+                _flattened_blob(subdivisions, 0.38, 0.78, 0.45),
+                _flattened_blob(subdivisions, 0.44, 0.72, 0.34),
+            ],
+            "shrub": [
+                _blob(subdivisions, 0.34, 0.42),
+                _flattened_blob(subdivisions, 0.40, 0.38, 0.62),
+            ],
         }
+
+        # Ancora toda copa no tronco.
+        #
+        # Cada copa e construida com um centro e um achatamento proprios, e o
+        # fundo dela sai de `centro - raio * achatamento`. Tres combinacoes
+        # caiam *acima* do topo do tronco - copa de guarda-chuva, conifera
+        # variante 2 e arbusto variante 2 - e a arvore aparecia com a copa
+        # flutuando meio metro acima da haste. Em vez de acertar os numeros um a
+        # um e torcer para a proxima variante nao repetir o erro, a ancoragem e
+        # verificada aqui: se o fundo da copa nao alcanca o tronco, a copa desce.
+        for especie, formas in self.canopies.items():
+            topo = float(self.trunks[especie][0][:, 2].max())
+            self.canopies[especie] = [
+                _anchor_canopy(forma, topo) for forma in formas
+            ]
 
     def trunk(self, species: str):
         return self.trunks.get(species, self.trunks["broadleaf"])
 
-    def canopy(self, species: str):
+    def variants(self, species: str) -> list:
         return self.canopies.get(species, self.canopies["broadleaf"])
+
+    def canopy(self, species: str, variant: int = 0):
+        opcoes = self.variants(species)
+        return opcoes[variant % len(opcoes)]
 
 
 # Detalhe por contexto, que e o mesmo principio do dossel levado ao individuo:
@@ -189,6 +255,16 @@ class TreePrototypes:
 # resolve com a copa de 20 faces. Trocar so isso corta dois tercos do custo da
 # vegetacao em massa, sem diferenca perceptivel de cima.
 MASS_CONTEXTS = {"forest"}
+
+# Tronco magro para vegetacao em massa.
+#
+# No prototipo barato o tronco e 13 dos 33 triangulos. A tentacao e remove-lo -
+# de cima ele esta debaixo da copa e nao aparece. Mas o mapa e olhado em
+# perspectiva obliqua, e sem tronco a copa fica **flutuando**, que e pior que
+# gastar os triangulos. Entao ele encolhe em vez de sumir: prisma de 3 lados
+# (7 triangulos) no lugar do de 5 (13). A esta distancia ninguem conta as faces
+# de um cilindro de 20 cm.
+MASS_TRUNK_SIDES = 3
 
 
 def _scatter(poly: Polygon, spacing: float, rng: np.random.Generator) -> np.ndarray:
@@ -297,6 +373,11 @@ SHELL_CELL_M = 8.0
 # Altura media do dossel e amplitude da ondulacao, em metros.
 SHELL_HEIGHT = 11.0
 SHELL_RELIEF = 2.6
+# Faixa em que o dossel sobe do chao ate a altura cheia. Com borda em degrau a
+# mata virava um planalto de topo reto; com a subida ela vira uma elevacao.
+SHELL_TAPER_M = 16.0
+# Quantas cores o dossel usa, amostradas da propria foto.
+SHELL_COLORS = 4
 
 
 def _split_shell(poly: Polygon, band: float):
@@ -357,7 +438,16 @@ def _canopy_surface(
         np.sin(plano_x / 27.0 + fase[0]) * np.cos(plano_y / 31.0 + fase[1])
         + 0.55 * np.sin(plano_x / 13.0 + fase[2]) * np.sin(plano_y / 11.0 + fase[3])
     )
-    topo = chao + layers.Z_GREEN + SHELL_HEIGHT + onda * SHELL_RELIEF
+
+    # Perto da borda o dossel desce ate o chao. Sem isso ele vira um planalto de
+    # topo reto com parede vertical em volta - a mata ficava com cara de mesa
+    # verde no modelo, que foi exatamente o defeito que apareceu em Araioses.
+    borda = shapely.distance(shapely.points(plano_x, plano_y), geom.boundary)
+    subida = np.clip(borda / SHELL_TAPER_M, 0.0, 1.0)
+    # Curva suave em vez de rampa reta: encosta arredondada.
+    subida = subida * subida * (3.0 - 2.0 * subida)
+
+    topo = chao + layers.Z_GREEN + (SHELL_HEIGHT + onda * SHELL_RELIEF) * subida
 
     verts = np.column_stack([plano_x, plano_y, topo])
     largura = len(xs)
@@ -378,63 +468,64 @@ def _canopy_surface(
         ]
     )
 
-    # Divide em duas tonalidades para o dossel nao virar uma chapa de cor unica.
-    n_cores = max(palette.canopy_count(), 1)
-    tom = (
-        (np.sin(plano_x[canto] / 34.0) + np.cos(plano_y[canto] / 29.0) + 2.0)
-        / 4.0
-        * n_cores
-    ).astype(np.int64) % n_cores
+    # A cor de cada celula vem da propria foto naquele ponto: mata de varzea,
+    # capoeira e mata fechada tem verdes bem diferentes, e uma cor so para tudo
+    # e o que mais denuncia o dossel como superficie pintada.
+    materiais, tom = _shell_materials(ctx, plano_x[canto], plano_y[canto], palette)
 
     total = 0
-    for i in range(n_cores):
+    for i, material in enumerate(materiais):
         parte = faces[np.tile(tom == i, 2)]
         if len(parte):
-            builder.add_mesh(palette.canopy(i), verts, parte)
+            builder.add_mesh(material, verts, parte)
             total += len(parte)
-
-    # Saia: fecha a lateral ate o chao, senao o dossel flutua onde a faixa de
-    # borda nao cobre.
-    total += _canopy_skirt(builder, ctx, geom, verts, dentro, largura, palette)
     return total
 
 
-def _canopy_skirt(builder, ctx, geom, verts, dentro, largura, palette) -> int:
-    """Parede vertical da borda do dossel ate o chao."""
-    contornos = [geom.exterior] if isinstance(geom, Polygon) else []
-    for parte in getattr(geom, "geoms", []):
-        if isinstance(parte, Polygon):
-            contornos.append(parte.exterior)
-    if not contornos:
-        return 0
-
-    material = palette.canopy(0)
-    total = 0
-    for anel in contornos:
-        pontos = np.asarray(anel.coords, dtype=np.float64)
-        if len(pontos) < 3:
-            continue
-        chao = np.zeros(len(pontos))
-        if ctx.draped:
-            chao = ctx.terrain.height(pontos[:, 0], pontos[:, 1])
-        # A altura da saia acompanha a media do dossel, sem a ondulacao.
-        topo = chao + layers.Z_GREEN + SHELL_HEIGHT * 0.72
-
-        n = len(pontos)
-        baixo = np.column_stack([pontos, chao + layers.Z_GREEN])
-        alto = np.column_stack([pontos, topo])
-        vertices = np.concatenate([baixo, alto])
-
-        i = np.arange(n - 1)
-        faces = np.concatenate(
-            [
-                np.column_stack([i, i + 1, i + 1 + n]),
-                np.column_stack([i, i + 1 + n, i + n]),
-            ]
+def _shell_materials(ctx, xs: np.ndarray, ys: np.ndarray, palette):
+    """Materiais do dossel amostrados na imagem. Devolve (materiais, indice)."""
+    n_estilo = max(palette.canopy_count(), 1)
+    if ctx.imagery is None:
+        # Sem foto, cai nas cores do estilo com uma variacao espacial lenta.
+        tom = ((np.sin(xs / 34.0) + np.cos(ys / 29.0) + 2.0) / 4.0 * n_estilo)
+        return (
+            [palette.canopy(i) for i in range(n_estilo)],
+            tom.astype(np.int64) % n_estilo,
         )
-        builder.add_mesh(material, vertices, faces)
-        total += len(faces)
-    return total
+
+    from ..core.mesh import Material
+    from ..imagery.sampling import blend, harmonize
+
+    from .coloring import quantize
+
+    geo = ctx.imagery
+    array = geo.array
+    altura, largura = array.shape[:2]
+    cols = np.empty(len(xs), dtype=np.int64)
+    linhas = np.empty(len(ys), dtype=np.int64)
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        c, r = geo.to_pixel(float(x), float(y))
+        cols[i], linhas[i] = c, r
+    cols = np.clip(cols, 0, largura - 1)
+    linhas = np.clip(linhas, 0, altura - 1)
+
+    cores = array[linhas, cols].astype(np.float64) / 255.0
+    rotulos, centros = quantize(cores, SHELL_COLORS, seed=ctx.settings.seed)
+
+    amount = ctx.settings.area_blend
+    materiais = [
+        Material(
+            name=f"dossel_sat_{i:02d}",
+            color=blend(
+                palette.canopy(i % n_estilo).color,
+                harmonize(tuple(float(c) for c in centro), saturation=1.1),
+                amount,
+            ),
+            roughness=palette.style.roughness,
+        )
+        for i, centro in enumerate(centros)
+    ]
+    return materiais, rotulos
 
 
 @dataclass
@@ -571,13 +662,21 @@ def generate_vegetation(
     # perto, e o barato para vegetacao em massa dentro de mata.
     prototypes = {
         "detalhe": TreePrototypes(settings.detail),
-        "massa": TreePrototypes("low"),
+        "massa": TreePrototypes("low", trunk_sides=MASS_TRUNK_SIDES),
     }
     palette = ctx.palette
     n_canopies = palette.canopy_count()
 
-    # (posicao x, y, z, escala, rotacao) por (grupo de detalhe, especie)
-    placements: dict[tuple[str, str], list[np.ndarray]] = {}
+    # O impostor (arvore como imagem num quad de 2 triangulos) foi implementado
+    # e descartado: o quad horizontal deita em vista obliqua, que e como este
+    # mapa e olhado, e nem o viewport do projeto nem o renderizador de software
+    # fazem alpha test - entao o recorte aparecia como quadrado preto. O modulo
+    # `generation/impostor.py` ficou documentado para quem quiser retomar.
+    atlas = None
+    impostor_faces = 0
+
+    # (posicao x, y, z, escala, rotacao) por (grupo de detalhe, especie, tronco)
+    placements: dict[tuple[str, str, bool], list[np.ndarray]] = {}
 
     def place(points: np.ndarray, rng: np.random.Generator, context: str):
         """Sorteia especie por ponto e guarda a transformacao de cada arvore."""
@@ -599,13 +698,14 @@ def generate_vegetation(
 
         scale = CONTEXT_SCALE[context] * (crown_scale if context != "street" else 1.0)
         grupo = "massa" if context in MASS_CONTEXTS else "detalhe"
+        com_tronco = True  # o tronco encolhe na massa, mas nunca some
         for index, name in enumerate(names):
             mask = chosen == index
             if not mask.any():
                 continue
             low, high = SPECIES_HEIGHT[name]
             heights = rng.uniform(low * scale, high * scale, size=int(mask.sum()))
-            placements.setdefault((grupo, name), []).append(
+            placements.setdefault((grupo, name, com_tronco), []).append(
                 np.column_stack(
                     [
                         points[mask, 0],
@@ -655,7 +755,7 @@ def generate_vegetation(
             place(points, rng, context="street")
 
     total = 0
-    for (grupo, species), chunks in placements.items():
+    for (grupo, species, com_tronco), chunks in placements.items():
         chunks = [c for c in chunks if len(c)]
         if not chunks:
             continue
@@ -667,17 +767,31 @@ def generate_vegetation(
         total += len(rows)
 
         modelos = prototypes[grupo]
-        builder.add_instances(palette.trunk, modelos.trunk(species), rows)
-        # Divide as copas entre as cores da paleta para quebrar a repeticao.
-        offset = abs(hash(species)) % max(n_canopies, 1)
-        canopy_index = (np.arange(len(rows)) + offset) % n_canopies
-        proto = modelos.canopy(species)
-        for i in range(n_canopies):
-            subset = rows[canopy_index == i]
-            if len(subset):
-                builder.add_instances(palette.canopy(i), proto, subset)
+        formas = modelos.variants(species)
+        indices = np.arange(len(rows))
+        variant_index = indices % len(formas)
 
-    if shell_faces:
+        if com_tronco:
+            builder.add_instances(palette.trunk, modelos.trunk(species), rows)
+
+        # Duas repeticoes a quebrar: a cor e a silhueta. Dividir por (cor x
+        # variante) da cor_n x variante_n combinacoes sem custar uma instancia a
+        # mais - continua tudo assado na mesma malha.
+        offset = abs(hash(species)) % max(n_canopies, 1)
+        canopy_index = (indices + offset) % n_canopies
+        for i in range(n_canopies):
+            for v in range(len(formas)):
+                subset = rows[(canopy_index == i) & (variant_index == v)]
+                if len(subset):
+                    builder.add_instances(palette.canopy(i), formas[v], subset)
+
+    if impostor_faces:
+        log.info(
+            "Impostor: %d arvores em %d triangulos (%.1f por arvore)",
+            total, impostor_faces, impostor_faces / max(total, 1),
+        )
+        ctx.report(f"{total} arvores (impostor, {impostor_faces} triangulos)", 1.0)
+    elif shell_faces:
         # O dossel nao conta como arvore, mas conta muito no arquivo: sem ele
         # essas mesmas manchas custariam alguns milhares de instancias.
         log.info("Dossel: %d triangulos cobrindo o miolo das matas", shell_faces)

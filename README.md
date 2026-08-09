@@ -142,7 +142,9 @@ Satélite e relevo:
 --roof-blend 0.75         # peso da foto nos telhados (0 = só estilo, 1 = só foto)
 --area-blend 0.55         # idem para terreno e áreas verdes
 --satellite-zoom 18       # força o nível (padrão: o maior com cobertura real)
---ground-texture          # experimental: cola a foto no terreno
+--ground-texture          # textura propria: repinta cada cobertura com a cor dela
+--ground-texture-mode foto  # em vez de pintar, cola a foto crua (modo antigo)
+--texture-variation 0.55  # 0 = chapado, 1 = quase a foto
 
 --relief                  # terreno com relevo real
 --exaggeration 1.5        # multiplica o desnível (1.0 = escala real)
@@ -370,9 +372,20 @@ diferença perceptível de cima. É o mesmo princípio do dossel, levado ao indi
 **Dossel.** Mancha de mata acima de 2.500 m² é separada em miolo e faixa de borda de
 13 m. A borda continua recebendo árvore, para a silhueta e a transição para o chão
 lerem certo. O miolo vira **uma superfície ondulada única** na altura das copas, a 2
-triângulos por célula de 8 m, com uma saia fechando a lateral até o chão. A ondulação
-é a soma de duas senoides com fase sorteada — não é ruído de verdade, mas duas
-frequências já quebram qualquer alinhamento visível de cima.
+triângulos por célula de 8 m. A ondulação é a soma de duas senoides com fase sorteada
+— não é ruído de verdade, mas duas frequências já quebram qualquer alinhamento
+visível de cima.
+
+Três correções depois da primeira versão, que saiu com cara de mesa verde:
+
+- **A borda sobe do chão** ao longo de 16 m, com curva suave (`3t² − 2t³`), em vez de
+  ter topo reto e parede vertical. A saia lateral deixou de ser necessária.
+- **O contorno é arredondado** antes de virar geometria. União de células quadradas
+  deixa uma borda em degrau que aparece de longe; fechar e abrir com junta redonda na
+  escala da célula tira a escada, e o `simplify` depois só enxuga os vértices.
+- **A cor vem da foto**, quantizada em 4 tons por k-means sobre a cor real amostrada
+  em cada célula. Mata de várzea, capoeira e mata fechada têm verdes bem diferentes, e
+  uma cor só para tudo era o que mais denunciava o dossel como superfície pintada.
 
 O dossel troca 60 mil triângulos por praticamente o mesmo tamanho de arquivo (ele não
 é instanciado, então cada célula custa vértice próprio). O ganho real dele é outro:
@@ -544,8 +557,183 @@ viraria uma primitiva glTF por edifício. Cada cor da paleta é misturada com a 
 estilo segundo `--roof-blend` / `--area-blend`: é aí que a foto e o desenho se
 encontram.
 
-`--ground-texture` existe para colar a foto no terreno com UV planar, mas fica
-**desligado por padrão**: a foto crua briga com a leitura low-poly do resto da cena.
+### `--ground-texture`: uma textura própria, pintada da foto
+
+Cor chapada por polígono resolve edifício, mas não resolve chão: cada mancha vira um
+bloco de cor única com degrau duro na divisa, e o terreno fica com cara de mapa de
+bloco. Colar a foto crua também não resolve — ela traz carro, sombra de poste, ruído
+de compressão e a própria rua, que o modelo já desenha em 3D.
+
+O caminho do meio: **classificar cada pixel e repintá-lo com a cor daquela cobertura
+naquele lugar**. Mata recebe o verde que a mata tem ali, gramado o verde do gramado
+dali, solo exposto o ocre do solo dali — cor medida, não cor de tabela. Não há padrão
+nem paleta fixa: a textura sai diferente em cada região porque as cores vêm da região.
+Em Araioses, medido:
+
+```
+cobertura: mata 44%, telha 29%, grama 12%, via 7%, agua 6%, solo 3%
+grama  rgb(125, 122,  91)     <- capim de fim de estação, não o verde de tabela
+mata   rgb( 68,  80,  50)
+solo   rgb(156, 124,  95)
+```
+
+Três decisões que fazem a diferença:
+
+- **Mediana, não média.** Uma sombra ou um telhado invadindo a máscara puxa a média e
+  não mexe na mediana.
+- **O que a malha já desenha em 3D não entra na textura.** Telhado, via e água herdam
+  o rótulo da cobertura válida mais próxima (uma `distance_transform_edt` resolve
+  todos de uma vez). O chão continua embaixo — só estava escondido.
+- **Parte da variação interna volta.** Cada pixel recebe o desvio de luminância dele
+  em relação à mediana da sua classe (`--texture-variation`, padrão 0,55). Em 0 a
+  classe vira tinta chapada; em 1 volta a ser a foto. O meio é manchado o bastante
+  para ter relevo e liso o bastante para continuar estilizado.
+
+Com a textura ligada, os retalhos chapados de parque e bosque deixam de ser
+desenhados — eles já estão na textura, e é justamente a sobreposição dos dois que
+produzia o degrau. `--ground-texture-mode foto` volta ao comportamento antigo de colar
+a imagem crua.
+
+#### O "8 ou 80": separação de frequências
+
+Repintar por classe resolve a cor, mas o chão continuava binário — ou tinta chapada,
+sem vida, ou a foto de satélite, que a 1,19 m/px está borrada e cheia de ruído de
+compressão. Faltava o meio.
+
+O meio tem nome: **uma foto de satélite só tem informação de frequência baixa.** A
+cor macro — onde muda de mata para pasto — ela tem, e é verdadeira. A frequência
+alta — o grão da terra, o agregado do asfalto, o recorte de copa — ela não tem, e
+nunca vai ter, porque o pixel dela é maior que o detalhe.
+
+Então cada banda vem de onde faz sentido: **a cor macro do dado, o grão do
+procedimento**, com escala e aspereza próprias de cada cobertura.
+
+| cobertura | escala do grão | amplitude |
+|---|---|---|
+| mata | 6,5 m | 0,21 (+ desvio de cor) |
+| solo | 2,6 m | 0,15 |
+| grama | 1,8 m | 0,10 |
+| via | 0,6 m | 0,06 |
+| água | 9,0 m | 0,04 |
+
+A textura sai a **0,35 m/px** — três vezes a resolução da foto — sem inventar foto
+nenhuma: o que foi acrescentado é material, não imagem. Os rótulos sobem por vizinho
+mais próximo, para a divisa entre coberturas continuar nítida; ampliá-los por
+interpolação criaria uma faixa de cobertura inexistente na borda de cada mancha.
+
+A calibração foi feita olhando a textura ao lado da foto: o primeiro ajuste tinha o
+dobro dessas amplitudes e o chão parecia **sujo**, não texturado. `--texture-grain 0`
+volta à cor chapada; `2` exagera.
+
+### Água: o rio nunca é "azul"
+
+O Negro é preto de tanino, o Solimões é barro, o Parnaíba é esverdeado de sedimento,
+uma lagoa costeira é quase turquesa. Cada corpo d'água agora recebe **a cor medida
+nele**, quantizada em 5 tons e misturada com o estilo — em Araioses o rio saiu
+`rgb(84, 122, 125)`, e não o `5b9dc9` da paleta.
+
+A amostragem é feita numa faixa estreita no eixo do rio: a borda tem margem, banco de
+areia e sombra de mata, que puxariam a cor para longe da água.
+
+Três tipos passaram a ser tratados à parte:
+
+- **Intermitente** (`intermittent=yes`). No semiárido é a maioria. Pintar de azul um
+  rio que só tem água na cheia é erro grosseiro de leitura da paisagem — o que se vê
+  de cima é areia. Agora vira leito seco no nível do chão.
+- **Canal e vala** não meandram: são obra. O suavizador de eixo deixou de ser aplicado
+  neles, porque produzia uma curva que não existe no terreno.
+- **Córrego** é raso e **rio** é fundo, com fatores de profundidade próprios.
+
+## Peso da cena
+
+Antes de otimizar, medir. O orçamento de Araioses (1,4 km, satélite + relevo +
+vegetação detectada) tinha um item que não devia estar lá:
+
+```
+215.601  41,1%  curb        <- embasamento dos prédios
+ 44.028   8,4%  window
+ 39.746   7,6%  trunk
+ 38.642   7,4%  ground_pintado
+```
+
+O embasamento é uma faixa de **18 cm** rente ao chão. Custava 41% da cena inteira e
+oito vezes o que custavam todos os prédios — porque `poly.buffer(0.18)` usa junta
+redonda por padrão, e cada canto do contorno virava 16 vértices. Com
+`join_style=2` (esquadria) o embasamento tem exatamente os cantos do prédio, e a
+18 cm ninguém vê a diferença. Uma palavra, 215 mil triângulos.
+
+Somado a parar de desenhar os retalhos de landuse sobre a textura pintada
+(25 mil triângulos que só reintroduziam o degrau duro), a escada de detalhe ficou:
+
+| detalhe | triângulos | arquivo | uso |
+|---|---|---|---|
+| `high` | 565k | 16,8 MB | close-up |
+| `medium` | 281k | 9,2 MB | padrão — era 524k / 17,6 MB |
+| `low` | 90k | 4,1 MB | anel intermediário |
+| `distante` | 64k | 3,4 MB | anel externo do carregamento dinâmico |
+
+Nove vezes entre o mais caro e o mais barato, com a mesma região.
+
+## Carregamento dinâmico: `streaming.py`
+
+### O Brasil inteiro cabe num modelo?
+
+Não, e não é questão de disco. Com o custo medido acima:
+
+| | triângulos | arquivo |
+|---|---|---|
+| Brasil em `medium` | 1,22 **trilhão** | 40 TB |
+| Brasil em `distante` | 277 **bilhões** | 14,5 TB |
+
+Nenhuma engine carrega 277 bilhões de triângulos e nenhuma placa desenha isso. Um
+modelo único do Brasil não é caro — é inútil.
+
+Mas a **matéria-prima** cabe: o OSM do Brasil tem ~2 GB em PBF, o relevo a 30 m cerca
+de 19 GB, e os contornos do Overture algumas dezenas de GB. Ou seja: *o modelo do
+Brasil não existe, mas o Brasil existe* — como dado de entrada de onde qualquer
+pedaço é construído em segundos.
+
+### Como funciona
+
+Nada é pré-gerado. O mundo é uma grade fixa indexada por `(nível, coluna, linha)`;
+um bloco só passa a existir quando a câmera chega perto; o detalhe cai com a
+distância, em anéis; e o que sai do alcance é descartado por um teto de memória.
+
+| anel | até | detalhe | lado do bloco |
+|---|---|---|---|
+| 0 | 1,5 km | `medium` | 1 km |
+| 1 | 4 km | `low` | 2 km |
+| 2 | 12 km | `distante` | 4 km |
+
+```python
+from mapforge.streaming import WorldStreamer
+
+streamer = WorldStreamer(settings, cache=cache, workers=3)
+streamer.move(-2.8909, -41.9050, radius_m=900)
+streamer.wait()                    # ou consulte streamer.ready() a cada quadro
+for tile in streamer.loaded():     # do mais perto para o mais longe
+    ...
+```
+
+**A memória depende do raio de visão, não do tamanho do mundo:** uma vista pede de 18
+a 57 blocos, seja em Araioses ou no meio da Amazônia. Medido em Araioses, raio de
+900 m: 15 blocos, 1,64 M triângulos, 139 s a frio, zero falhas. Andando 1 km ao
+norte, **10 dos 16 blocos são reaproveitados** e só 6 são gerados.
+
+Dois defeitos que só apareceram rodando de verdade:
+
+- **O cache SQLite não era seguro entre threads.** Os blocos são gerados em paralelo
+  e todos consultam o cache; o SQLite recusa uma conexão criada em outra thread, e
+  **45 de 46 blocos falhavam** com uma mensagem que não parecia ter nada a ver com
+  geração de mapa. A conexão passou a ser serializada por lock, com os resultados
+  materializados dentro dele (devolver o cursor não bastaria: ele é posicional).
+- **Uma consulta Overpass por vista estoura o limite de 25 km².** Uma vista de 12 km
+  de raio tem ~98 km². O download é agrupado por nível — um bloco de nível 2 tem
+  16 km² sozinho, então quantos cabem por consulta depende do nível.
+
+O gargalo continua sendo a rede, não a malha: um bloco leva de 15 a 42 s, quase tudo
+esperando imagem de satélite. O bloco `distante` já baixa a foto num zoom mais baixo
+e pula a detecção de vegetação — sozinho isso o levou de 140 s para 30 s.
 
 ## Relevo
 

@@ -10,7 +10,13 @@ from shapely.ops import unary_union
 from ..core.features import MapData
 from ..core.mesh import MeshBuilder, Scene
 from .buildings import generate_buildings
-from .coloring import build_area_materials, build_ground_color, build_roof_materials
+from .coloring import (
+    build_area_materials,
+    build_ground_color,
+    build_road_materials,
+    build_roof_materials,
+    build_water_materials,
+)
 from .context import GenerationContext
 from .roads import generate_railways, generate_roads
 from .structures import generate_street_lamps, generate_structures
@@ -26,6 +32,7 @@ def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
     started = time.perf_counter()
     builder = MeshBuilder(terrain=ctx.terrain, clip=ctx.clip)
     stats: dict[str, int] = {}
+    ctx.map_data = map_data
 
     # Porte do assentamento antes de qualquer geometria: e o teto de pavimentos
     # de todo predio sem altura em tag.
@@ -45,6 +52,12 @@ def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
                 ctx.roof_materials = build_roof_materials(ctx, map_data.buildings)
             ctx.area_materials = build_area_materials(ctx, map_data)
             ctx.ground_material = build_ground_color(ctx)
+            if ctx.settings.water:
+                ctx.water_materials = build_water_materials(
+                    ctx, map_data.waters, map_data.rivers
+                )
+            if ctx.settings.roads:
+                ctx.road_materials = build_road_materials(ctx, map_data.roads)
         except Exception as exc:  # noqa: BLE001 - segue com a paleta do estilo
             log.warning("Amostragem de cores falhou: %s", exc)
 

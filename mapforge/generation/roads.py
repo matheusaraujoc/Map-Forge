@@ -361,6 +361,9 @@ def generate_roads(
         "cobble": palette.cobble,
         "dirt": palette.dirt,
     }
+    # Onde a foto informou a cor do pavimento, ela manda: o asfalto gasto de uma
+    # cidade pequena nao e o cinza do estilo, e a terra tem a cor do solo dali.
+    materials.update(getattr(ctx, "road_materials", None) or {})
 
     ground_surfaces: dict[str, list] = {key: [] for key in SURFACE_PRIORITY}
     elevated: list[tuple[float, str, object]] = []
@@ -449,15 +452,25 @@ def generate_roads(
             except Exception:  # noqa: BLE001
                 pass
         if not sidewalk.is_empty:
-            builder.add_prism(
-                palette.curb,
-                sidewalk,
-                layers.Z_GROUND,
-                layers.Z_CURB,
-                cap_top=True,
-                top_material=palette.sidewalk,
-                drape=ctx.draped,
-            )
+            if ctx.detail["curb_walls"]:
+                builder.add_prism(
+                    palette.curb,
+                    sidewalk,
+                    layers.Z_GROUND,
+                    layers.Z_CURB,
+                    cap_top=True,
+                    top_material=palette.sidewalk,
+                    drape=ctx.draped,
+                )
+            else:
+                # O degrau do meio-fio tem 12 cm. As paredes verticais dele
+                # custavam 215 mil triangulos em Araioses - 41% da cena inteira -
+                # porque o perimetro da calcada acompanha cada reentrancia de
+                # cada casa e de cada esquina. A calcada vira uma superficie no
+                # nivel do degrau: some a parede, fica a faixa.
+                builder.add_flat(
+                    palette.sidewalk, sidewalk, layers.Z_CURB, drape=ctx.draped
+                )
         paved_union = extent
 
     # --- sinalizacao horizontal ---

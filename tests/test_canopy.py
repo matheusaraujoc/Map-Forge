@@ -66,8 +66,26 @@ def test_celulas_vizinhas_viram_um_poligono_so():
     polys = _polygonize(mask, GeoFalso(np.zeros((40, 40, 3), dtype=np.uint8)), 4.0, 10.0)
 
     assert len(polys) == 1
-    # 40 x 40 m inteiros: o fechamento nao pode comer a celula da borda.
-    assert polys[0].area == 1_600
+    # 40 x 40 m: o fechamento nao pode comer a celula da borda. O arredondamento
+    # dos cantos tira alguns por cento, e so.
+    assert 0.88 * 1_600 < polys[0].area <= 1_600
+
+
+def test_contorno_sai_arredondado_e_nao_em_escada():
+    """A uniao de celulas quadradas deixa degraus que aparecem no modelo 3D."""
+    mask = np.zeros((60, 60), dtype=bool)
+    # Diagonal em blocos: o caso que produz a escada.
+    for i in range(12):
+        mask[i * 5 : (i + 1) * 5, : (i + 1) * 5] = True
+
+    geo = GeoFalso(np.zeros((60, 60, 3), dtype=np.uint8))
+    polys = _polygonize(mask, geo, 5.0, 50.0)
+
+    assert polys
+    maior = max(polys, key=lambda p: p.area)
+    # Uma escada de 12 degraus tem ~24 vertices so na diagonal; arredondada e
+    # simplificada, o contorno inteiro cabe em bem menos.
+    assert len(maior.exterior.coords) < 24
 
 
 def test_imagem_sem_verde_nao_inventa_vegetacao():
@@ -147,6 +165,7 @@ class _CtxDossel:
 
     draped = False
     terrain = None
+    imagery = None
     palette = _Palette()
 
 
