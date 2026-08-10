@@ -196,37 +196,59 @@ function polygonAreaM2(pts) {
   return Math.abs(soma) / 2;
 }
 
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+function svgNode(tipo, atributos) {
+  // `createElementNS` em vez de `innerHTML`.
+  //
+  // Montar filhos de um <svg> por `innerHTML` depende do parser tratar o
+  // fragmento no namespace SVG. Quando isso nao acontece, os nos nascem como
+  // HTML desconhecido: eles entram no DOM, nao dao erro nenhum e **nao
+  // desenham nada**. Era exatamente o sintoma - os vertices entravam no estado,
+  // a area fechava e ia para o Python, mas a tela ficava vazia, entao parecia
+  // que o clique nao tinha funcionado.
+  const no = document.createElementNS(SVGNS, tipo);
+  for (const [chave, valor] of Object.entries(atributos)) {
+    if (valor !== null && valor !== undefined && valor !== '') {
+      no.setAttribute(chave, valor);
+    }
+  }
+  return no;
+}
+
 function drawShape() {
   const svg = el.shape;
-  if (!drawing && shape.length < 3) { svg.style.display = 'none'; svg.innerHTML = ''; return; }
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  if (!drawing && shape.length < 3) { svg.style.display = 'none'; return; }
   svg.style.display = 'block';
 
   const pts = shape.map(p => latLonToScreen(p.lat, p.lon));
-  const partes = [];
 
   if (shape.length >= 2) {
     const d = pts.map(p => `${p.x},${p.y}`).join(' ');
-    partes.push(drawing
-      ? `<polyline points="${d}"/>`
-      : `<polygon points="${d}"/>`);
+    svg.appendChild(svgNode(drawing ? 'polyline' : 'polygon', { points: d }));
   }
   if (drawing && hover && pts.length) {
     const ultimo = pts[pts.length - 1];
     const h = latLonToScreen(hover.lat, hover.lon);
-    partes.push(`<polyline class="guide" points="${ultimo.x},${ultimo.y} ${h.x},${h.y}`
-      + (pts.length >= 2 ? ` ${pts[0].x},${pts[0].y}` : '') + `"/>`);
+    const guia = `${ultimo.x},${ultimo.y} ${h.x},${h.y}`
+      + (pts.length >= 2 ? ` ${pts[0].x},${pts[0].y}` : '');
+    svg.appendChild(svgNode('polyline', { class: 'guide', points: guia }));
   }
   pts.forEach((p, i) => {
-    partes.push(`<circle class="${i === 0 ? 'first' : ''}" cx="${p.x}" cy="${p.y}" r="${i === 0 ? 6 : 4}"/>`);
+    svg.appendChild(svgNode('circle', {
+      class: i === 0 ? 'first' : '', cx: p.x, cy: p.y, r: i === 0 ? 6 : 4,
+    }));
   });
 
   const area = polygonAreaM2(shape);
   if (area > 0 && pts.length >= 3) {
     const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
     const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
-    partes.push(`<text x="${cx}" y="${cy}" text-anchor="middle">${(area / 1e6).toFixed(2)} km2</text>`);
+    const rotulo = svgNode('text', { x: cx, y: cy, 'text-anchor': 'middle' });
+    rotulo.textContent = `${(area / 1e6).toFixed(2)} km2`;
+    svg.appendChild(rotulo);
   }
-  svg.innerHTML = partes.join('');
 }
 
 function commitShape() {
@@ -253,49 +275,87 @@ function setDrawing(on) {
   shape = on ? [] : shape;
   hover = null;
   document.getElementById('btn-draw').classList.toggle('active', on);
-  el.map.classList.toggle('selecting', on);
   if (on) {
+    // `setSelecting(false)` tem de vir ANTES de marcar o cursor: ele tambem
+    // mexe na classe 'selecting', e quando vinha depois apagava a cruz que o
+    // modo de desenho acabara de por. Sem cursor de cruz a ferramenta parecia
+    // nao ter ligado - o botao acendia e o mapa continuava com a mao de
+    // arrastar.
     setSelecting(false);
     selection = null;
     drawBox();
     el.status.innerHTML =
-      'Clique para marcar cada canto. <b>Duplo clique</b> ou <b>Enter</b> fecha a area; '
+      'Clique para marcar cada canto. <b>Arraste</b> para mover o mapa. '
+      + '<b>Duplo clique</b> ou <b>Enter</b> fecha a area; '
       + '<b>Backspace</b> desfaz o ultimo ponto; <b>Esc</b> cancela.';
   }
+  el.map.classList.toggle('selecting', on);
   drawShape();
 }
 
 /* --- interacao --- */
 let drag = null;
+// Quanto o ponteiro pode andar entre apertar e soltar e ainda contar como
+// clique. Acima disso foi arrasto.
+const CLICK_SLOP = 4;
+
 el.map.addEventListener('mousedown', e => {
-  if (drawing) { e.preventDefault(); return; }  // no desenho, o clique e do vertice
   const rect = el.map.getBoundingClientRect();
   drag = { x: e.clientX, y: e.clientY, px: e.clientX - rect.left, py: e.clientY - rect.top,
-           mode: (selecting || e.shiftKey) ? 'select' : 'pan' };
-  el.map.classList.toggle('panning', drag.mode === 'pan');
+           x0: e.clientX, y0: e.clientY, moved: false,
+           // Desenhando, arrastar move o mapa: sem isso nao havia como desenhar
+           // uma area maior que a tela - o mousedown era descartado e o mapa
+           // ficava preso enquanto a ferramenta estivesse ligada.
+           mode: (!drawing && (selecting || e.shiftKey)) ? 'select' : 'pan' };
+  el.map.classList.toggle('panning', drag.mode === 'pan' && !drawing);
   e.preventDefault();
 });
 
-el.map.addEventListener('click', e => {
-  if (!drawing) return;
-  const rect = el.map.getBoundingClientRect();
-  const p = screenToLatLon(e.clientX - rect.left, e.clientY - rect.top);
-  // Clicar em cima do primeiro ponto fecha a area.
+/* O vertice e colocado no `mouseup`, nao no `click`.
+
+   O `click` e um evento sintetico: o navegador so o emite se julgar que a
+   sequencia mousedown/mouseup formou um clique, e essa decisao depende de
+   detalhes do embutidor. A selecao retangular sempre funcionou, e ela usa
+   mousedown/mousemove/mouseup - entao o desenho passa a usar o mesmo caminho,
+   que nesta janela esta comprovadamente vivo.
+
+   O duplo clique tambem deixa de depender do evento `dblclick`: dois toques
+   perto no tempo e no espaco fecham a area. */
+const DUPLO_MS = 400, DUPLO_PX = 10;
+let ultimoToque = { t: 0, x: 0, y: 0 };
+
+function colocarVertice(px, py) {
+  const agora = Date.now();
+  const perto = Math.hypot(px - ultimoToque.x, py - ultimoToque.y) < DUPLO_PX;
+  if (shape.length >= 3 && perto && agora - ultimoToque.t < DUPLO_MS) {
+    commitShape();
+    return;
+  }
+  ultimoToque = { t: agora, x: px, y: py };
+
+  // Tocar em cima do primeiro ponto tambem fecha a area.
   if (shape.length >= 3) {
     const primeiro = latLonToScreen(shape[0].lat, shape[0].lon);
-    const dx = primeiro.x - (e.clientX - rect.left), dy = primeiro.y - (e.clientY - rect.top);
-    if (Math.hypot(dx, dy) < 12) { commitShape(); return; }
+    if (Math.hypot(primeiro.x - px, primeiro.y - py) < 12) { commitShape(); return; }
   }
-  shape.push(p);
-  drawShape();
-});
 
-el.map.addEventListener('dblclick', e => {
-  if (drawing) { e.preventDefault(); commitShape(); }
-});
+  shape.push(screenToLatLon(px, py));
+  drawShape();
+  // Retorno imediato no status: separa "o toque nao chega" de "o toque chega e
+  // nao aparece" se algo quebrar de novo.
+  el.status.innerHTML = shape.length < 3
+    ? `<b>${shape.length}</b> ponto(s) marcado(s). Marque pelo menos 3.`
+    : `<b>${shape.length}</b> pontos. Toque duas vezes no mesmo lugar, ou `
+      + `<b>Enter</b>, para fechar a area.`;
+}
 
 window.addEventListener('mousemove', e => {
-  if (drawing) {
+  if (drag && !drag.moved
+      && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) > CLICK_SLOP) {
+    drag.moved = true;
+    if (drawing) el.map.classList.add('panning');
+  }
+  if (drawing && !(drag && drag.moved)) {
     const rect = el.map.getBoundingClientRect();
     hover = screenToLatLon(e.clientX - rect.left, e.clientY - rect.top);
     drawShape();
@@ -320,9 +380,15 @@ window.addEventListener('mousemove', e => {
   }
 });
 
-window.addEventListener('mouseup', () => {
-  if (drag && drag.mode === 'select' && selection) commitSelection();
+window.addEventListener('mouseup', e => {
+  if (drag && drag.mode === 'select' && selection && drag.moved) commitSelection();
   if (drag) el.map.classList.remove('panning');
+  // `drag` so existe se o toque comecou dentro do mapa: e o que impede um
+  // mouseup vindo de um botao do painel de virar vertice.
+  if (drawing && drag && !drag.moved) {
+    const rect = el.map.getBoundingClientRect();
+    colocarVertice(e.clientX - rect.left, e.clientY - rect.top);
+  }
   drag = null;
 });
 
@@ -355,7 +421,13 @@ window.addEventListener('keydown', e => {
   else if (e.key === 'Backspace') { e.preventDefault(); shape.pop(); drawShape(); }
 });
 
-document.getElementById('btn-draw').onclick = () => setDrawing(!drawing);
+document.getElementById('btn-draw').onclick = e => {
+  // Tira o foco do botao: com ele focado, Enter e Espaco reativam o botao e
+  // desligam o modo de desenho no mesmo toque em que o usuario tenta fechar a
+  // area.
+  e.currentTarget.blur();
+  setDrawing(!drawing);
+};
 document.getElementById('btn-select').onclick = () => {
   if (drawing) setDrawing(false);
   setSelecting(!selecting);

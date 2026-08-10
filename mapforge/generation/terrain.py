@@ -262,7 +262,7 @@ def _ground_material(ctx: GenerationContext):
         desenhado = redraw_ground(
             imagery,
             ctx.map_data,
-            target_mpp=ctx.settings.texture_detail_m or 0.35,
+            target_mpp=ctx.settings.texture_detail_m or 0.22,
             seed=ctx.settings.seed,
         )
         ctx.painted_ground = desenhado

@@ -28,7 +28,13 @@ EARTH_CIRCUMFERENCE = 40_075_016.686
 TILE_SIZE = 256
 
 # Teto de tiles por regiao, para nao disparar centenas de requisicoes sem querer.
-MAX_TILES = 400
+#
+# 400 tiles cobrem 6,4 km de lado no zoom 17 (1,19 m/px). Acima disso o zoom
+# caia, e com ele **tudo o que deriva da foto**: a classificacao de cobertura
+# passava a rodar em 2,39 m/px, o desenho do chao herdava a imprecisao e o mapa
+# grande saia incoerente. Como o tile fica em cache e so a primeira geracao de
+# cada regiao paga, o teto sobe para cobrir ~12 km no mesmo zoom.
+MAX_TILES = 1600
 
 
 class TileError(RuntimeError):
@@ -146,7 +152,22 @@ def meters_per_pixel(lat: float, zoom: int) -> float:
     return EARTH_CIRCUMFERENCE * math.cos(math.radians(lat)) / (TILE_SIZE * 2.0**zoom)
 
 
-def choose_zoom(bbox: BBox, provider: TileProvider, max_pixels: int = 4096) -> int:
+# Lado maximo da foto montada, em pixels.
+#
+# Era 4096, e esse era o **verdadeiro** limitador da resolucao em regiao grande -
+# nao o teto de tiles. Numa regiao de 6 km, 4096 px forcam 1,46 m/px, entao o
+# zoom 17 (1,19 m/px) nao cabia e caia para o 16 (2,39 m/px). Como tudo que vem
+# da foto herda isso - classificacao de cobertura, cor amostrada, deteccao -, o
+# mapa grande saia incoerente por causa de uma constante.
+#
+# 8192 sustenta 1,19 m/px ate ~9,7 km de lado. A foto ocupa 201 MB em memoria no
+# pior caso, e os tiles ficam em cache: so a primeira geracao da regiao paga.
+DEFAULT_MAX_PIXELS = 8192
+
+
+def choose_zoom(
+    bbox: BBox, provider: TileProvider, max_pixels: int = DEFAULT_MAX_PIXELS
+) -> int:
     """Maior zoom cuja imagem ainda cabe em `max_pixels` no lado maior."""
     lat = bbox.center[0]
     largest = max(bbox.width_m, bbox.height_m)
@@ -254,7 +275,7 @@ def fetch_imagery(
     provider_name: str = "esri",
     cache=None,
     zoom: Optional[int] = None,
-    max_pixels: int = 4096,
+    max_pixels: int = DEFAULT_MAX_PIXELS,
     workers: int = 12,
     progress: Optional[ProgressFn] = None,
     force: bool = False,
@@ -285,7 +306,7 @@ def download_mosaic(
     provider: TileProvider,
     zoom: Optional[int] = None,
     cache=None,
-    max_pixels: int = 4096,
+    max_pixels: int = DEFAULT_MAX_PIXELS,
     workers: int = 12,
     progress: Optional[ProgressFn] = None,
     force: bool = False,

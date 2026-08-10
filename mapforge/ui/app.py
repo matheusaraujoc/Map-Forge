@@ -502,14 +502,24 @@ class MainWindow(QWidget):
                 "'Selecionar em volta do centro do mapa'.",
             )
             return
+        # O limite de area deixou de ser recusa e virou aviso: o download do OSM
+        # se divide sozinho em pedacos aceitos pelo Overpass. O que sobra e o
+        # custo, que cresce com a area - por isso ainda se pergunta.
         if self.bbox.area_km2 > config.MAX_AREA_KM2:
-            QMessageBox.warning(
+            resposta = QMessageBox.question(
                 self,
-                "Area grande demais",
-                f"A selecao tem {self.bbox.area_km2:.1f} km2, acima do limite de "
-                f"{config.MAX_AREA_KM2} km2.\nReduza a area selecionada.",
+                "Area grande",
+                f"A selecao tem {self.bbox.area_km2:.1f} km2.\n\n"
+                "O download sera dividido em varias consultas e a geracao pode "
+                "levar alguns minutos, com arquivo grande no fim.\n\n"
+                "Para regioes muito maiores, prefira gerar em blocos "
+                "(comando 'region'), que grava um arquivo por bloco.\n\n"
+                "Continuar?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
             )
-            return
+            if resposta != QMessageBox.StandardButton.Yes:
+                return
         if self.worker is not None and self.worker.isRunning():
             return
 

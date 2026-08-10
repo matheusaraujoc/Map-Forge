@@ -52,6 +52,53 @@ def polygon_to_local(coords, projection: LocalProjection):
     return polygon if (polygon is not None and not polygon.is_empty) else None
 
 
+# Lado da celula que decide se um pedaco do mapa ja tem contorno, em metros.
+GAP_CELL_M = 220.0
+
+
+def _fill_only_gaps(detectados, map_data, bbox):
+    """Mantem so os retangulos detectados onde nenhuma fonte de contorno chegou.
+
+    A deteccao por imagem e a ultima linha, e o numero justifica o cuidado:
+    medida contra o Overture em Araioses, ela tem **49,6% de precisao e 61,4% de
+    falso positivo** - areia e solo exposto lidos como telhado. Sobre um bairro
+    que o Overture ja mapeou, ela nao acrescenta predio nenhum que faltasse; so
+    espalha retangulo claro sobre o chao, que foi exatamente o defeito relatado.
+
+    Onde nao ha fonte alguma, porem, ela continua sendo a diferenca entre uma
+    cidade vazia e uma cidade povoada - entao a decisao e por regiao, nao global:
+    o mapa e dividido em celulas e a deteccao so vale nas celulas sem contorno.
+    """
+    if not detectados:
+        return []
+
+    existentes = [b for b in map_data.buildings if b.footprint is not None]
+    if not existentes:
+        return list(detectados)
+
+    half_w, half_h = bbox.width_m / 2.0, bbox.height_m / 2.0
+
+    def celula(x: float, y: float) -> tuple[int, int]:
+        return (int((x + half_w) // GAP_CELL_M), int((y + half_h) // GAP_CELL_M))
+
+    ocupadas = set()
+    for predio in existentes:
+        ponto = predio.footprint.representative_point()
+        ocupadas.add(celula(ponto.x, ponto.y))
+
+    aceitos = []
+    for poly in detectados:
+        ponto = poly.representative_point()
+        if celula(ponto.x, ponto.y) not in ocupadas:
+            aceitos.append(poly)
+
+    log.info(
+        "Deteccao: %d de %d retangulos mantidos (o resto caiu onde ja havia contorno)",
+        len(aceitos), len(detectados),
+    )
+    return aceitos
+
+
 def load_map(
     bbox: BBox,
     cache: Optional[Cache] = None,
@@ -198,8 +245,9 @@ def generate(
             progress("procurando telhados na imagem", 0.44)
         try:
             detection = detect_buildings(imagery, map_data)
+            aceitos = _fill_only_gaps(detection.polygons, map_data, bbox)
             start_id = -100_000
-            for offset, polygon in enumerate(detection.polygons):
+            for offset, polygon in enumerate(aceitos):
                 map_data.buildings.append(
                     Building(
                         osm_id=start_id - offset,
@@ -209,8 +257,13 @@ def generate(
                         building_type="yes",
                     )
                 )
+            descartados = len(detection.polygons) - len(aceitos)
             if progress:
-                progress(f"detectados na imagem: +{len(detection.polygons)}", 0.47)
+                progress(
+                    f"detectados na imagem: +{len(aceitos)}"
+                    + (f" ({descartados} descartados onde ja havia contorno)" if descartados else ""),
+                    0.47,
+                )
         except Exception as exc:  # noqa: BLE001 - a cena segue sem a deteccao
             log.warning("Deteccao de edificios falhou: %s", exc)
 

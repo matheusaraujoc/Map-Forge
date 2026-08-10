@@ -109,7 +109,18 @@ class MapView(QWebEngineView):
         channel = QWebChannel(self)
         channel.registerObject("bridge", self.bridge)
         self.page().setWebChannel(channel)
-        self.setUrl(QUrl.fromLocalFile(str(MAP_HTML)))
+        # Carrega com a data do arquivo na URL.
+        #
+        # O QtWebEngine tem cache de disco proprio e ele vale tambem para
+        # `file://`. Sem isto, editar `map.html` e reabrir o programa podia
+        # continuar servindo a versao anterior - e a correcao simplesmente nao
+        # chegava a tela, sem nenhum sinal de que estava velha.
+        url = QUrl.fromLocalFile(str(MAP_HTML))
+        try:
+            url.setQuery(f"v={int(MAP_HTML.stat().st_mtime)}")
+        except OSError:  # pragma: no cover - arquivo sempre existe
+            pass
+        self.setUrl(url)
         self.setMinimumWidth(420)
 
     # ------------------------------------------------------------ comandos JS
