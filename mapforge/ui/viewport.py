@@ -16,13 +16,41 @@ import math
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from ..core.mesh import Scene
 
 log = logging.getLogger(__name__)
+
+# --- voo livre ---
+#
+# Tecla -> (avanco, lateral, vertical), em fracao do passo. As setas e o WASD
+# fazem a mesma coisa: as setas sao o que se espera de um mapa, o WASD e o que
+# quem vem de jogo procura primeiro.
+FLIGHT_KEYS: dict[int, tuple[float, float, float]] = {
+    Qt.Key_Up: (1.0, 0.0, 0.0),
+    Qt.Key_W: (1.0, 0.0, 0.0),
+    Qt.Key_Down: (-1.0, 0.0, 0.0),
+    Qt.Key_S: (-1.0, 0.0, 0.0),
+    Qt.Key_Left: (0.0, -1.0, 0.0),
+    Qt.Key_A: (0.0, -1.0, 0.0),
+    Qt.Key_Right: (0.0, 1.0, 0.0),
+    Qt.Key_D: (0.0, 1.0, 0.0),
+    Qt.Key_E: (0.0, 0.0, 1.0),
+    Qt.Key_PageUp: (0.0, 0.0, 1.0),
+    Qt.Key_Q: (0.0, 0.0, -1.0),
+    Qt.Key_PageDown: (0.0, 0.0, -1.0),
+}
+
+# Shift acelera. Fica fora de FLIGHT_KEYS porque sozinho nao move nada.
+MODIFIER_KEYS = {Qt.Key_Shift}
+
+# Passo por quadro, como fracao da distancia da camera ao alvo.
+FLIGHT_FRACTION = 0.022
+FLIGHT_BOOST = 4.0
+FLIGHT_INTERVAL_MS = 16
 
 VERTEX_SHADER = """
 #version 330
@@ -124,6 +152,26 @@ class OrbitCamera:
     def zoom(self, factor: float) -> None:
         self.distance = float(np.clip(self.distance * factor, 5.0, 60_000.0))
 
+    def fly(self, forward: float, right: float, up: float) -> None:
+        """Voa: desloca o ponto observado, e a camera vai junto.
+
+        A camera continua orbital - o que muda de lugar e o alvo. Assim o voo
+        nao briga com o arrasto do mouse: gira-se a vista com o mouse e anda-se
+        para onde ela aponta com o teclado, que e como se navega num mapa.
+
+        O avanco e **horizontal**. Usar o vetor de visao cheio faria a camera
+        mergulhar no chao ao andar para a frente com a vista inclinada, que e a
+        posicao normal aqui.
+        """
+        direcao = self.target - self.eye()
+        direcao[2] = 0.0
+        norma = float(np.linalg.norm(direcao))
+        frente = direcao / norma if norma > 1e-6 else np.array([1.0, 0.0, 0.0])
+        lado = np.array([frente[1], -frente[0], 0.0])
+        self.target = self.target + frente * forward + lado * right + np.array(
+            [0.0, 0.0, up]
+        )
+
     def pan(self, dx: float, dy: float) -> None:
         """Desloca o alvo no plano da tela, na escala da distancia atual."""
         forward = self.target - self.eye()
@@ -187,6 +235,14 @@ class Viewport(QOpenGLWidget):
         self._last_mouse = None
         self._background = (0.86, 0.90, 0.95)
 
+        # Voo livre: as teclas presas ficam num conjunto e quem move a camera e
+        # o relogio. Mover dentro do keyPressEvent amarraria a velocidade a taxa
+        # de repeticao do teclado do sistema, que varia de maquina para maquina.
+        self._held: set[int] = set()
+        self._flight = QTimer(self)
+        self._flight.setInterval(FLIGHT_INTERVAL_MS)
+        self._flight.timeout.connect(self._step_flight)
+
         self._key_dir = np.array([-0.45, -0.62, 0.65], dtype="f4")
         self._key_dir /= np.linalg.norm(self._key_dir)
         self._fill_dir = np.array([0.55, 0.35, 0.25], dtype="f4")
@@ -249,8 +305,13 @@ class Viewport(QOpenGLWidget):
             if scene is None or not scene.groups:
                 return
 
+            from ..generation.colliders import is_collider
+
             for name, group in scene.groups.items():
                 if len(group.faces) == 0:
+                    continue
+                # Fisica nao se desenha: ela e para a engine.
+                if is_collider(name):
                     continue
                 uv = group.uv
                 if uv is None:
@@ -291,6 +352,7 @@ class Viewport(QOpenGLWidget):
             self.camera.frame(scene.bounds())
             self.statusChanged.emit(
                 f"{scene.triangle_count:,} triangulos, {len(self._batches)} materiais"
+                "  |  setas/WASD para voar, Q/E sobe e desce, Shift acelera, F enquadra"
             )
         finally:
             self.doneCurrent()
@@ -367,8 +429,58 @@ class Viewport(QOpenGLWidget):
         self.camera.zoom(0.86**steps)
         self.update()
 
+    # ----------------------------------------------------------------- teclado
+
     def keyPressEvent(self, event):  # noqa: N802
         if event.key() in (Qt.Key_F, Qt.Key_Home):
             self.reset_view()
-        else:
-            super().keyPressEvent(event)
+            return
+        if event.key() in FLIGHT_KEYS:
+            # `isAutoRepeat` e ignorado de proposito: quem move e o relogio, nao
+            # a repeticao do teclado. Sem isso a velocidade dependeria da taxa de
+            # repeticao configurada no sistema.
+            self._held.add(event.key())
+            if not self._flight.isActive():
+                self._flight.start()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):  # noqa: N802
+        if event.isAutoRepeat():
+            return
+        self._held.discard(event.key())
+        if not self._held:
+            self._flight.stop()
+        if event.key() not in FLIGHT_KEYS:
+            super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event):  # noqa: N802
+        # Sem isto uma tecla segurada no momento em que a aba muda ficaria presa
+        # e a camera continuaria andando sozinha.
+        self._held.clear()
+        self._flight.stop()
+        super().focusOutEvent(event)
+
+    def _step_flight(self) -> None:
+        """Um quadro de voo. Chamado pelo relogio enquanto houver tecla presa."""
+        if not self._held:
+            self._flight.stop()
+            return
+
+        avante = right = subir = 0.0
+        for key, (df, dr, du) in FLIGHT_KEYS.items():
+            if key in self._held:
+                avante += df
+                right += dr
+                subir += du
+
+        # A velocidade acompanha a distancia da camera: de longe se cobre a
+        # cidade, de perto se anda pela rua. Sem isso um passo util a 50 m
+        # atravessa o mapa inteiro a 5 km.
+        passo = max(self.camera.distance * FLIGHT_FRACTION, 0.35)
+        if self._held & MODIFIER_KEYS:
+            passo *= FLIGHT_BOOST
+
+        if avante or right or subir:
+            self.camera.fly(avante * passo, right * passo, subir * passo)
+            self.update()

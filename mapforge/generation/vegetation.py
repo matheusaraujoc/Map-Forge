@@ -774,6 +774,19 @@ def generate_vegetation(
         if com_tronco:
             builder.add_instances(palette.trunk, modelos.trunk(species), rows)
 
+        # Colisor da arvore: cilindro no tronco. A copa nao colide - ninguem
+        # esbarra em folha, e cercar a copa faria a arvore ocupar o dobro do
+        # espaco que ela de fato ocupa no chao. As medidas saem do proprio
+        # prototipo, entao palmeira e arbusto ganham o cilindro certo.
+        if ctx.settings.colliders:
+            proto_v = np.asarray(modelos.trunk(species)[0], dtype=np.float64)
+            raio_unit = float(np.abs(proto_v[:, :2]).max())
+            topo_unit = float(proto_v[:, 2].max())
+            for x, y, z, escala, _rot in rows:
+                ctx.collider_cylinders.append(
+                    (float(x), float(y), float(z), topo_unit * escala, raio_unit * escala)
+                )
+
         # Duas repeticoes a quebrar: a cor e a silhueta. Dividir por (cor x
         # variante) da cor_n x variante_n combinacoes sem custar uma instancia a
         # mais - continua tudo assado na mesma malha.

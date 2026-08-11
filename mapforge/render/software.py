@@ -72,8 +72,14 @@ def _gather(scene: Scene) -> _Batch:
     textures: list[np.ndarray] = []
     offset = 0
 
-    for group in scene.groups.values():
+    from ..generation.colliders import is_collider
+
+    for name, group in scene.groups.items():
         if len(group.faces) == 0:
+            continue
+        # A malha de fisica existe para a engine, nao para a imagem: desenha-la
+        # cobriria o mapa inteiro com caixas.
+        if is_collider(name):
             continue
         material = group.material
         n_faces = len(group.faces)

@@ -815,6 +815,11 @@ def generate_buildings(
             base_z += ctx.terrain.min_over(poly) - 0.6
         wall_top = base_z + height
 
+        # A forma de colisao e anotada aqui, com a altura que este gerador
+        # escolheu: e o que faz o colisor bater com o predio que se ve.
+        if ctx.settings.colliders:
+            ctx.collider_boxes.append((poly, base_z, wall_top))
+
         builder.add_walls(wall_mat, poly, base_z, wall_top)
 
         roof = _pick_roof(building, ctx, rng, poly)

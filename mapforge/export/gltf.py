@@ -102,8 +102,33 @@ def export_scene(scene: Scene, path: str | Path, yup: bool = True) -> Path:
         merged = tri_scene.dump(concatenate=True)
         merged.export(path)
 
+    metadata = _split_colliders(scene.metadata, path)
     sidecar = path.with_suffix(path.suffix + ".json")
-    sidecar.write_text(json.dumps(scene.metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    sidecar.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
     log.info("Exportado %s (%.1f MB)", path, path.stat().st_size / 1e6)
     return path
+
+
+def _split_colliders(metadata: dict, path: Path) -> dict:
+    """Grava as formas de colisao num arquivo proprio ao lado do modelo.
+
+    Elas ficam fora do sidecar de metadados por tamanho: o campo de altura do
+    chao e uma matriz, e numa regiao de alguns km2 ela sozinha e maior que todo
+    o resto dos metadados somado. Quem quer a fisica abre o arquivo da fisica.
+    """
+    colisores = metadata.get("colliders")
+    if not isinstance(colisores, dict) or not colisores.get("formato"):
+        return metadata
+
+    destino = path.with_name(path.stem + ".colisores.json")
+    destino.write_text(json.dumps(colisores, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Colisores: %s", destino)
+
+    enxuto = dict(metadata)
+    enxuto["colliders"] = {
+        "arquivo": destino.name,
+        "formato": colisores["formato"],
+        "resumo": colisores.get("resumo", ""),
+    }
+    return enxuto

@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
     """Executa o pipeline de geracao na ordem em que as camadas se empilham."""
     started = time.perf_counter()
-    builder = MeshBuilder(terrain=ctx.terrain, clip=ctx.clip)
+    builder = MeshBuilder(terrain=ctx.terrain, clip=ctx.clip, log=ctx.geometry_log)
     stats: dict[str, int] = {}
     ctx.map_data = map_data
 
@@ -126,6 +126,26 @@ def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
     stats["structures"] = generate_structures(builder, ctx, map_data.structures)
     stats["lamps"] = generate_street_lamps(builder, ctx, roads)
 
+    # --- malha de fisica ---
+    #
+    # Sai depois de todo o visual porque e alimentada pelo que os geradores de
+    # fato produziram, nao por uma segunda leitura do MapData.
+    colisores = None
+    if ctx.settings.colliders:
+        ctx.report("malha de fisica", 0.92)
+        try:
+            from .colliders import add_collider_meshes, build_colliders
+
+            colisores = build_colliders(ctx, map_data, water_union)
+            stats["fisica"] = add_collider_meshes(
+                builder, colisores, naming=ctx.settings.collider_naming
+            )
+            ctx.collider_set = colisores
+            ctx.report(f"fisica: {colisores.summary()}", 0.94)
+        except Exception as exc:  # noqa: BLE001 - a cena visual continua valendo
+            log.warning("Malha de fisica falhou: %s", exc)
+            colisores = None
+
     ctx.report("finalizando malha", 0.95)
     groups = builder.build()
     elapsed = time.perf_counter() - started
@@ -147,6 +167,8 @@ def build_scene(map_data: MapData, ctx: GenerationContext) -> Scene:
             "build_seconds": round(elapsed, 2),
         },
     )
+    if colisores is not None:
+        scene.metadata["colliders"] = colisores.to_dict()
     if ctx.terrain is not None:
         scene.metadata["terrain"] = {
             "grid": [len(ctx.terrain.xs), len(ctx.terrain.ys)],
