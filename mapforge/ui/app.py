@@ -87,6 +87,7 @@ class MainWindow(QWidget):
 
         self.bbox: Optional[BBox] = None
         self.clip_polygon = None  # contorno desenhado a mao, quando houver
+        self.diagnostic_log: Optional[Path] = None
         self.worker: Optional[GenerationWorker] = None
         self.geocoder: Optional[GeocodeWorker] = None
         self.renderer: Optional[RenderWorker] = None
@@ -333,6 +334,64 @@ class MainWindow(QWidget):
         relief_form.addRow("Exagero vertical", self.exaggeration)
         form_layout.addWidget(relief_box)
 
+        # --- fisica ---
+        physics_box = QGroupBox("Fisica")
+        physics_form = QFormLayout(physics_box)
+        self.colliders = QCheckBox("Gerar malha de colisao")
+        self.colliders.setToolTip(
+            "Formas simples para a engine, em nos separados do visual:\n"
+            "caixa por edificio (na orientacao do proprio predio), cilindro no\n"
+            "tronco de cada arvore, campo de altura para o chao seguindo o\n"
+            "relevo e um volume por corpo d'agua.\n\n"
+            "A malha bonita nao serve como colisor: um predio tem centenas de\n"
+            "triangulos para responder 'bati na casa?', que uma caixa responde\n"
+            "sozinha.\n\n"
+            "Sai tambem um JSON ao lado do modelo com as formas analiticas -\n"
+            "centro, tamanho, raio, giro -, que e o que permite criar colisor\n"
+            "primitivo na engine em vez de malha.\n\n"
+            "Nao aparece no viewport nem no render: e para a engine."
+        )
+        physics_form.addRow(self.colliders)
+
+        self.collider_naming = QComboBox()
+        for chave, rotulo in (
+            ("godot", "Godot  (sufixo -colonly)"),
+            ("unreal", "Unreal  (prefixo UCX_)"),
+            ("plain", "Sem marcacao"),
+        ):
+            self.collider_naming.addItem(rotulo, chave)
+        self.collider_naming.setEnabled(False)
+        self.collider_naming.setToolTip(
+            "glTF nao tem fisica no padrao, entao convencao de nome e o unico\n"
+            "canal que existe - e cada engine escolheu a sua."
+        )
+        self.colliders.toggled.connect(self.collider_naming.setEnabled)
+        physics_form.addRow("Convencao", self.collider_naming)
+        form_layout.addWidget(physics_box)
+
+        # --- diagnostico ---
+        diag_box = QGroupBox("Diagnostico")
+        diag_layout = QVBoxLayout(diag_box)
+        self.diagnose = QCheckBox("Registrar log de execucao em arquivo")
+        self.diagnose.setToolTip(
+            "Grava, enquanto gera, tudo que cada etapa relata - e no fim anexa o\n"
+            "retrato da cena: para cada superficie visivel de cima, QUAL GERADOR\n"
+            "a criou.\n\n"
+            "Serve para investigar defeito visual sem adivinhar. O material\n"
+            "sozinho nao identifica a origem: 'curb' e meio-fio, embasamento,\n"
+            "laje de ponte e pilar de viaduto ao mesmo tempo.\n\n"
+            "O arquivo vai para output/logs/ e e escrito linha a linha, entao\n"
+            "pode ser lido durante a geracao."
+        )
+        self.diagnose.toggled.connect(self._on_diagnose_toggle)
+        diag_layout.addWidget(self.diagnose)
+
+        self.diagnose_path = QLabel("<i>desligado</i>")
+        self.diagnose_path.setWordWrap(True)
+        self.diagnose_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        diag_layout.addWidget(self.diagnose_path)
+        form_layout.addWidget(diag_box)
+
         # --- camadas ---
         layers_box = QGroupBox("Camadas")
         layers_layout = QVBoxLayout(layers_box)
@@ -406,6 +465,30 @@ class MainWindow(QWidget):
             widget.setEnabled(checked)
             if not checked:
                 widget.setChecked(False)
+
+    def _on_diagnose_toggle(self, ligado: bool) -> None:
+        """Abre (ou fecha) o arquivo da sessao de diagnostico."""
+        from ..diagnostics import encerrar_sessao, iniciar_sessao
+
+        if not ligado:
+            encerrar_sessao()
+            self.diagnostic_log = None
+            self.diagnose_path.setText("<i>desligado</i>")
+            return
+
+        try:
+            caminho = iniciar_sessao()
+        except Exception as exc:  # noqa: BLE001 - so o diagnostico falha
+            self.diagnose.setChecked(False)
+            QMessageBox.warning(self, "Diagnostico", f"Nao foi possivel abrir o log:\n{exc}")
+            return
+
+        self.diagnostic_log = caminho
+        self.diagnose_path.setText(
+            f"<span style='color:#2a6'>gravando em</span><br>"
+            f"<code>{caminho}</code>"
+        )
+        self.status.setText(f"Log de diagnostico: {caminho}")
 
     def _on_bbox(self, bbox: Optional[BBox]) -> None:
         self.bbox = bbox
@@ -490,6 +573,9 @@ class MainWindow(QWidget):
             detect_buildings=self.detect_buildings.isChecked(),
             detect_vegetation=self.detect_vegetation.isChecked(),
             redraw_ground=self.redraw_ground.isChecked(),
+            colliders=self.colliders.isChecked(),
+            collider_naming=self.collider_naming.currentData() or "godot",
+            diagnose=self.diagnose.isChecked(),
         )
 
     def _start(self, kind: str) -> None:
@@ -534,6 +620,7 @@ class MainWindow(QWidget):
             output,
             kind=kind,
             clip_polygon=self.clip_polygon,
+            diagnostic_log=self.diagnostic_log,
             parent=self,
         )
         self.worker.progressed.connect(self._on_progress)
@@ -632,6 +719,29 @@ def _quiet_chromium() -> None:
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--log-level=3"
 
 
+def _registrar_falha(exc: BaseException) -> Path:
+    """Grava o traceback de uma falha de abertura num arquivo.
+
+    Quando a janela nao abre, o traceback vai para o terminal - e se a interface
+    foi iniciada por um atalho, ou se o terminal foi fechado, ele se perde. Um
+    arquivo ao lado do resto da saida deixa o defeito sempre recuperavel.
+    """
+    import traceback
+
+    destino = config.OUTPUT_DIR / "logs" / "erro_inicializacao.log"
+    try:
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(
+            f"{datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"python {sys.version}\n\n"
+            + "".join(traceback.format_exception(exc)),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 - nao ha mais o que fazer
+        pass
+    return destino
+
+
 def run(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="  %(levelname)s %(name)s: %(message)s")
     config.ensure_dirs()
@@ -640,7 +750,17 @@ def run(argv: Optional[list[str]] = None) -> int:
     configure_surface_format()
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("MapForge")
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except Exception as exc:  # noqa: BLE001 - a janela nao abriu: diga por que
+        caminho = _registrar_falha(exc)
+        log.exception("A janela nao pode ser construida")
+        QMessageBox.critical(
+            None,
+            "MapForge nao abriu",
+            f"Falha ao montar a janela:\n\n{exc}\n\nDetalhes em:\n{caminho}",
+        )
+        return 1
     # Janela maximizada, nao tela cheia sem moldura: o mapa de selecao e o
     # viewport 3D ganham o espaco todo, e a barra de titulo continua ali para
     # mover e redimensionar.

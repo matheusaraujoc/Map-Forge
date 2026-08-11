@@ -13,6 +13,7 @@ from . import config
 from .core.geo import BBox
 from .data import Cache, geocode
 from .generation import GenerationSettings
+from .generation.colliders import NAMING
 from .pipeline import generate, load_map
 from .styles import list_styles
 
@@ -97,6 +98,8 @@ def _settings_from_args(args) -> GenerationSettings:
         canopy_shell=args.canopy_shell,
         redraw_ground=args.redraw_ground,
         urban_scale=args.urban_scale,
+        colliders=args.colliders,
+        collider_naming=args.collider_naming,
     )
 
 
@@ -146,6 +149,9 @@ def cmd_generate(args) -> int:
     print(f"  malha     : {scene.triangle_count:,} triangulos, {scene.vertex_count:,} vertices")
     print(f"  materiais : {len(scene.groups)}")
     print(f"  tempo     : {scene.metadata['build_seconds']}s de geracao")
+    fisica = scene.metadata.get("colliders")
+    if isinstance(fisica, dict) and fisica.get("resumo"):
+        print(f"  fisica    : {fisica['resumo']}")
     print(f"  arquivo   : {result.output}  ({size_mb:.1f} MB)")
     if args.save_project:
         print(f"  projeto   : '{args.save_project}' salvo (apenas parametros)")
@@ -346,6 +352,56 @@ def cmd_segment(args) -> int:
     for chave, fracao in sorted(seg.fractions().items(), key=lambda kv: -kv[1]):
         print(f"    {chave:<16} {fracao * 100:5.1f}%")
     print(f"  desenho  : {saida}")
+    return 0
+
+
+def cmd_diagnose(args) -> int:
+    """De onde saiu cada pedaco do que se ve de cima."""
+    from .diagnostics import manchas, mapa_anotado, o_que_ha_em, relatorio, top_down
+
+    bbox, label = _resolve_bbox(args)
+    settings = _settings_from_args(args)
+    settings.diagnose = True
+
+    print(f"  regiao: {bbox.width_m:.0f} x {bbox.height_m:.0f} m", file=sys.stderr)
+    progress = Progress(not args.quiet)
+    with Cache() as cache:
+        result = generate(bbox, settings=settings, cache=cache, progress=progress)
+    progress.done()
+
+    scene, log = result.scene, result.geometry_log
+    # Uma rasterizacao so para tudo: e a etapa cara.
+    visao = top_down(scene, passo=args.step)
+    print()
+    print(f"  procedencia: {log.summary()}")
+    print(f"  rasterizado a {visao.passo:.2f} m por celula")
+    print()
+    print(relatorio(scene, log, limite=args.top, visao=visao))
+
+    achadas = manchas(scene, log, area_min=args.min_area, visao=visao)
+    chapas = [m for m in achadas if m.e_chapa]
+    faixas = [m for m in achadas if not m.e_chapa]
+
+    print()
+    print(f"  manchas claras: {len(chapas)} chapas, {len(faixas)} faixas")
+    print("  (chapa = espessura >= 4 m; faixa e calcada, meio-fio, sinalizacao)")
+    if chapas:
+        print()
+        print(f"  {'#':>3}  {'origem':<28}{'material':<16}{'area':>8}{'esp':>7}  centro")
+        for n, m in enumerate(chapas[: args.top], start=1):
+            print(f"  {n:>3}  {m.origem:<28}{m.material:<16}{m.area:>8.0f}"
+                  f"{m.espessura:>7.1f}  {m.x:.0f},{m.y:.0f}")
+
+    if args.at:
+        x, y = (float(v) for v in args.at.replace(";", ",").split(","))
+        print()
+        print(o_que_ha_em(scene, log, x, y, raio=args.radius_m))
+
+    if not args.no_image:
+        destino = Path(args.out) if args.out else config.OUTPUT_DIR / f"diagnostico_{label[:24]}.png"
+        caminho = mapa_anotado(scene, destino, marcar=chapas[: args.top], visao=visao)
+        print()
+        print(f"  mapa anotado: {caminho}")
     return 0
 
 
@@ -604,6 +660,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="multiplica o desnivel; 1.0 mantem a escala real",
     )
 
+    fisica = gen.add_argument_group("fisica")
+    fisica.add_argument(
+        "--colliders",
+        action="store_true",
+        help="gera a malha de colisao em formas simples (caixa por predio, "
+        "cilindro por arvore, campo de altura para o chao) em nos proprios, "
+        "mais um JSON com as formas analiticas ao lado do modelo",
+    )
+    fisica.add_argument(
+        "--collider-naming",
+        dest="collider_naming",
+        choices=tuple(NAMING),
+        default="godot",
+        help="convencao de nome do no de colisao: 'godot' usa -colonly, "
+        "'unreal' usa UCX_, 'plain' nao marca (padrao: godot)",
+    )
+
     gen.add_argument("--save-project", help="guarda os parametros no banco local com esse nome")
     gen.set_defaults(func=cmd_generate)
 
@@ -671,6 +744,10 @@ def build_parser() -> argparse.ArgumentParser:
     region.add_argument("--relief", action="store_true", dest="elevation")
     region.add_argument("--relief-zoom", type=int, default=None, dest="elevation_zoom")
     region.add_argument("--exaggeration", type=float, default=1.0)
+    region.add_argument("--colliders", action="store_true")
+    region.add_argument(
+        "--collider-naming", dest="collider_naming", choices=tuple(NAMING), default="godot"
+    )
     for flag in ("no-terrain", "no-roads", "no-buildings", "no-water",
                  "no-vegetation", "no-sidewalks", "no-windows"):
         region.add_argument(f"--{flag}", action="store_true", dest=flag.replace("-", "_"))
@@ -704,6 +781,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="desenha por cima os contornos que o detector extraiu",
     )
     segment.set_defaults(func=cmd_segment)
+
+    diag = sub.add_parser(
+        "diagnose",
+        help="de onde saiu cada pedaco do que se ve de cima",
+        description="Gera a cena com o registro de procedencia ligado e diz, para "
+        "cada superficie visivel de cima, qual gerador a criou. Existe para "
+        "investigar defeito visual sem adivinhar: material sozinho nao "
+        "identifica origem - 'curb' pode ser meio-fio, embasamento, laje de "
+        "ponte ou pilar de viaduto.",
+    )
+    _add_region_args(diag)
+    diag.add_argument("--out", help="PNG do mapa anotado")
+    diag.add_argument(
+        "--at", help="x,y em metros locais: lista tudo que ha sobre esse ponto"
+    )
+    diag.add_argument(
+        "--radius-m", type=float, default=4.0, dest="radius_m",
+        help="raio da consulta do --at, em metros (padrao: 4)",
+    )
+    diag.add_argument(
+        "--step", type=float, default=0.5,
+        help="lado da celula da rasterizacao, em metros (padrao: 0.5)",
+    )
+    diag.add_argument(
+        "--min-area", type=float, default=40.0, dest="min_area",
+        help="area minima de mancha listada, em m2 (padrao: 40)",
+    )
+    diag.add_argument("--top", type=int, default=25, help="quantas linhas listar")
+    diag.add_argument(
+        "--no-image", action="store_true", dest="no_image", help="nao grava o PNG"
+    )
+    # Mesmas opcoes de geracao do `generate`, para reproduzir a cena investigada.
+    diag.add_argument("--style", default="lowpoly")
+    diag.add_argument("--detail", default="medium", choices=("low", "medium", "high"))
+    diag.add_argument("--region", default=None, dest="region")
+    diag.add_argument("--seed", type=int, default=1)
+    diag.add_argument("--tree-density", type=float, default=1.0, dest="tree_density")
+    diag.add_argument("--max-trees", type=int, default=40_000, dest="max_trees")
+    diag.add_argument("--height-scale", type=float, default=1.0, dest="height_scale")
+    diag.add_argument("--satellite", action="store_true")
+    diag.add_argument("--provider", default="esri")
+    diag.add_argument("--satellite-zoom", type=int, default=None, dest="satellite_zoom")
+    diag.add_argument("--roof-blend", type=float, default=0.75, dest="roof_blend")
+    diag.add_argument("--area-blend", type=float, default=0.55, dest="area_blend")
+    diag.add_argument("--ground-texture", action="store_true", dest="ground_texture")
+    diag.add_argument(
+        "--ground-texture-mode", dest="ground_texture_mode",
+        choices=("pintada", "foto"), default="pintada",
+    )
+    diag.add_argument("--texture-variation", type=float, default=0.55, dest="texture_variation")
+    diag.add_argument("--redraw-ground", action="store_true", dest="redraw_ground")
+    diag.add_argument("--overture", action="store_true")
+    diag.add_argument("--footprints", action="store_true")
+    diag.add_argument("--detect-buildings", action="store_true", dest="detect_buildings")
+    diag.add_argument("--detect-vegetation", action="store_true", dest="detect_vegetation")
+    diag.add_argument("--canopy-shell", action="store_true", dest="canopy_shell")
+    diag.add_argument("--shadow-heights", action="store_true", dest="shadow_heights")
+    diag.add_argument(
+        "--urban-scale", dest="urban_scale", default=None,
+        choices=("povoado", "pequena", "media", "grande"),
+    )
+    diag.add_argument("--relief", action="store_true", dest="elevation")
+    diag.add_argument("--relief-zoom", type=int, default=None, dest="elevation_zoom")
+    diag.add_argument("--exaggeration", type=float, default=1.0)
+    diag.add_argument("--colliders", action="store_true")
+    diag.add_argument(
+        "--collider-naming", dest="collider_naming", choices=tuple(NAMING), default="godot"
+    )
+    for flag in ("no-terrain", "no-roads", "no-buildings", "no-water",
+                 "no-vegetation", "no-sidewalks", "no-windows"):
+        diag.add_argument(f"--{flag}", action="store_true", dest=flag.replace("-", "_"))
+    diag.set_defaults(func=cmd_diagnose)
 
     providers = sub.add_parser("providers", help="lista as fontes de imagem de satelite")
     providers.set_defaults(func=cmd_providers)

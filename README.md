@@ -26,9 +26,10 @@ py -3.11 run.py generate --place "Ouro Preto, MG" --radius 450 --satellite --ren
 | 6 | Otimizações (chunks, LOD, instancing, culling) | LOD por nível de detalhe; chunks e culling pendentes |
 | 7 | IA (opcional) | fora do MVP, por escolha |
 
-Fora do planejamento original, já funcionando: viewport 3D navegável, imagem de
-satélite como fonte de cor, terreno com relevo real, e um renderizador offscreen em
-software para gerar imagens sem abrir uma engine.
+Fora do planejamento original, já funcionando: viewport 3D navegável com voo livre,
+imagem de satélite como fonte de cor, terreno com relevo real, sistema de pontes,
+malha de física para engine (`--colliders`) e um renderizador offscreen em software
+para gerar imagens sem abrir uma engine.
 
 ## Instalação
 
@@ -69,12 +70,27 @@ retangulares.
 | Orbitar | arrastar com o botão esquerdo |
 | Deslocar | arrastar com o botão do meio ou direito |
 | Aproximar | roda do mouse |
+| **Voar** | setas ou `WASD` |
+| **Subir / descer** | `Q` e `E`, ou `PageUp` / `PageDown` |
+| **Acelerar** | segurar `Shift` |
 | Enquadrar | tecla `F` ou botão *Enquadrar* |
+
+No voo livre a câmera continua orbital: o que o teclado move é o **alvo**, e a câmera
+vai junto. Assim o voo não briga com o mouse — gira-se a vista arrastando e anda-se
+para onde ela aponta com o teclado. O avanço é horizontal de propósito: usar o vetor de
+visão cheio faria a câmera mergulhar no chão ao andar para a frente com a vista
+inclinada, que é a posição normal aqui.
+
+O passo acompanha a distância da câmera ao alvo. De longe se cobre a cidade, de perto
+se anda pela rua; com passo fixo, o que é útil a 50 m atravessa o mapa inteiro a 5 km.
+Quem move a câmera é um relógio de 16 ms, não a repetição do teclado — senão a
+velocidade dependeria da configuração de repetição de cada máquina.
 
 **Aba Imagem** — planta 2D e renders salvos.
 
-**Painel** — estilo, detalhe, seed, satélite, relevo, camadas, altura dos prédios e
-densidade de vegetação. *Prévia 2D* roda só o parser (rápido); *Gerar 3D* roda o
+**Painel** — estilo, detalhe, seed, satélite, fontes de edifícios, relevo, física,
+camadas, altura dos prédios e densidade de vegetação. *Prévia 2D* roda só o parser
+(rápido); *Gerar 3D* roda o
 pipeline completo e joga o resultado no viewport. *Salvar render PNG* usa o ângulo
 atual da câmera do viewport.
 
@@ -130,8 +146,9 @@ Fontes de edifícios:
 --footprints              # reserva: contornos abertos da Microsoft
 --detect-buildings        # detecta telhados na imagem (exige --satellite)
 --detect-vegetation       # detecta mata e gramado na imagem (exige --satellite)
---no-canopy-shell         # arvore individual tambem no miolo da mata (pesado)
+--canopy-shell            # miolo da mata vira uma superficie unica (desligado por padrao)
 --shadow-heights          # estima altura pela sombra na imagem (exige --satellite)
+--urban-scale povoado|pequena|media|grande   # forca o porte do assentamento
 ```
 
 Satélite e relevo:
@@ -145,10 +162,18 @@ Satélite e relevo:
 --ground-texture          # textura propria: repinta cada cobertura com a cor dela
 --ground-texture-mode foto  # em vez de pintar, cola a foto crua (modo antigo)
 --texture-variation 0.55  # 0 = chapado, 1 = quase a foto
+--redraw-ground           # redesenha o chao como desenho chapado (exige --ground-texture)
 
 --relief                  # terreno com relevo real
 --exaggeration 1.5        # multiplica o desnível (1.0 = escala real)
 --relief-zoom 15
+```
+
+Física:
+
+```powershell
+--colliders               # malha de colisão + JSON com as formas analíticas
+--collider-naming godot|unreal|plain
 ```
 
 `--relief` e não `--elevation` porque `--elevation` já é o ângulo da câmera do render.
@@ -393,7 +418,12 @@ O dossel troca 60 mil triângulos por praticamente o mesmo tamanho de arquivo (e
 escala — numa região de vários km² de mata, o orçamento de árvores rarefaria a
 floresta até sumir, enquanto o dossel custa o mesmo por hectare sempre.
 
-Desligue com `--no-canopy-shell` para ter árvore individual em toda parte.
+**O dossel está desligado por padrão**, e a economia média de 10% da cena não pagou os
+defeitos: a cor por célula de 8 m produzia um xadrez verde que não existe em mata
+nenhuma, o afunilamento da borda dobrava a superfície e abria buracos escuros, e o
+miolo ficava vazio justamente onde há árvore de verdade. Árvore individual com o
+protótipo barato custa 10% a mais e não tem nenhum desses problemas. Ligue com
+`--canopy-shell` para experimentar.
 
 ### Coerência de porte: o perfil urbano
 
@@ -622,27 +652,188 @@ mais próximo, para a divisa entre coberturas continuar nítida; ampliá-los por
 interpolação criaria uma faixa de cobertura inexistente na borda de cada mancha.
 
 A calibração foi feita olhando a textura ao lado da foto: o primeiro ajuste tinha o
-dobro dessas amplitudes e o chão parecia **sujo**, não texturado. `--texture-grain 0`
-volta à cor chapada; `2` exagera.
+dobro dessas amplitudes e o chão parecia **sujo**, não texturado. O multiplicador do
+grão existe como parâmetro da biblioteca (`texture_grain`, 0 = cor chapada, 2 =
+exagerado); na linha de comando o controle exposto é `--texture-variation`.
+
+#### `--redraw-ground`: o chão como desenho, não como textura
+
+O modo acima ainda tenta parecer material. `--redraw-ground` faz outra coisa: repinta
+o chão como um **desenho chapado** — poucas cores por cobertura, manchas grandes,
+contorno curvo e limpo, sem grão nem ruído de alta frequência. A alta resolução serve
+para a *borda* ficar lisa, não para caber detalhe, pelo mesmo motivo que um desenho
+vetorial é nítido em qualquer tamanho. As cores continuam saindo dos percentis da
+própria cobertura na foto, então areia rosada sai rosada e mata de várzea sai escura.
+
+Exige `--ground-texture`.
 
 ### Água: o rio nunca é "azul"
 
 O Negro é preto de tanino, o Solimões é barro, o Parnaíba é esverdeado de sedimento,
-uma lagoa costeira é quase turquesa. Cada corpo d'água agora recebe **a cor medida
-nele**, quantizada em 5 tons e misturada com o estilo — em Araioses o rio saiu
-`rgb(84, 122, 125)`, e não o `5b9dc9` da paleta.
+uma lagoa costeira é quase turquesa. Cada corpo d'água recebe **a cor medida nele**,
+misturada com o estilo — em Araioses o rio saiu `rgb(84, 122, 125)`, e não o `5b9dc9`
+da paleta.
 
 A amostragem é feita numa faixa estreita no eixo do rio: a borda tem margem, banco de
 areia e sombra de mata, que puxariam a cor para longe da água.
 
-Três tipos passaram a ser tratados à parte:
+Três tipos são tratados à parte:
 
 - **Intermitente** (`intermittent=yes`). No semiárido é a maioria. Pintar de azul um
   rio que só tem água na cheia é erro grosseiro de leitura da paisagem — o que se vê
-  de cima é areia. Agora vira leito seco no nível do chão.
+  de cima é areia. Vira leito seco no nível do chão.
 - **Canal e vala** não meandram: são obra. O suavizador de eixo deixou de ser aplicado
   neles, porque produzia uma curva que não existe no terreno.
 - **Córrego** é raso e **rio** é fundo, com fatores de profundidade próprios.
+
+### O leito: três defeitos medidos
+
+Um rio errado é o defeito mais visível que este gerador produz, porque ele atravessa
+o mapa inteiro. Os três que existiam foram medidos, não estimados:
+
+**1. Ilhas de terra dentro do rio.** A escavação usava uma rampa que dava peso 0,5 na
+borda *interna* do polígono e crescia até 1 no miolo, "para suavizar dos dois lados".
+O resultado é que um vértice logo dentro da margem descia só metade do caminho — e num
+terreno 2 m acima do leito ele parava **acima da lâmina**. Medido em Araioses, num
+único rio: **245 vértices de terra acima da água**, o mais alto por 1,82 m. Quem tem
+de ser gradual é o lado de fora, que é o talude; o leito é leito. Depois da correção:
+**0**.
+
+**2. O nível saía da caixa envolvente.** O nível da água vinha do percentil baixo das
+alturas amostradas na *bounding box* do corpo. Um rio diagonal preenche uma fração
+pequena da própria caixa — medido em Araioses, a caixa tem **cinco vezes a área do
+rio** —, então a amostra era sobretudo a encosta em volta e a água nascia alta demais.
+Amostrando por dentro, o mesmo rio caiu de 3,64 m para 2,33 m.
+
+**3. Um nível só para o rio inteiro.** Funciona em lago e falha em rio: numa descida de
+900 m a lâmina plana ou flutua acima do terreno na cabeceira ou fica enterrada na foz.
+O corpo passou a ser fatiado ao longo do próprio eixo em trechos de ~140 m, cada um
+com o seu nível, suavizados e **obrigados a não subir para jusante** — sem isso um
+pico de ruído do DEM levanta uma represa que não existe. Lago continua inteiro: água
+parada tem um nível só, e fatiá-lo inventaria desnível.
+
+O nível por trecho trouxe um defeito próprio, que também precisou de medição: escavar
+cada trecho até o **seu** nível produz um açude em cada emenda. O leito do trecho de
+cima fica uma profundidade abaixo do nível dele, o que ainda pode estar acima da
+lâmina do trecho de baixo — num vale com 1,3 m de queda por trecho e 0,5 m de lâmina
+sobram 0,8 m de leito seco atravessado no meio do rio. Medido: **106 de 328 vértices**
+de leito acima da água, já com a escavação corrigida dentro de cada trecho. A correção
+é escavar cada trecho até o nível do **vizinho mais baixo**. Depois: **0**.
+
+### Montagem por blocos: o rio na emenda
+
+Dois defeitos só aparecem quando os blocos são postos lado a lado, e ambos se
+manifestam no rio, que é a feição mais longa a atravessar a divisa:
+
+- **A referência de altura era por bloco.** Cada campo de altura normaliza subtraindo
+  o mínimo do próprio recorte — certo numa cena única, errado em blocos: dois vizinhos
+  têm mínimos diferentes, o mesmo ponto do terreno recebe z diferente nos dois, e o rio
+  aparece em duas alturas. A região agora mede a referência uma vez e a passa a todos
+  os blocos.
+- **A cor da água era agrupada por bloco.** O k-means agrupa *as amostras que
+  recebeu*: cada bloco via só os seus corpos d'água, achava centros diferentes e
+  batizava todos de `water_sat_00`, `water_sat_01`… O mesmo rio saía com uma cor num
+  bloco e outra no vizinho. Agora a cor cai num **reticulado fixo** de 15 níveis por
+  canal e o nome do material sai da célula — dois blocos que amostram o mesmo rio
+  produzem o mesmo material.
+
+## Pontes
+
+Havia um sistema de ponte antes, e ele fazia uma coisa só: fechar o vão por baixo com
+uma laje. A premissa estava escrita no código — *"a pista permanece no nível do solo,
+quem está rebaixado é o rio"* — e ela é falsa quando há relevo.
+
+Com relevo a pista é **assentada no terreno**, e o terreno debaixo do rio acabou de ser
+escavado alguns metros pela geração da água. A pista então acompanhava a escavação e
+**mergulhava no leito**: descia dentro do rio, atravessava o fundo e subia do outro
+lado, com a laje descendo junto. Medido em Ouro Preto (700 m, 303 m de desnível, 30
+travessias), a pista sobre a água ficava **0,37 m abaixo da lâmina na mediana e 4,16 m
+no pior caso**. Não era ponte; era vau.
+
+Uma ponte precisa de três coisas que a laje sozinha não dava:
+
+1. **Vão plano.** O trecho de pista sobre a água **sai** da superfície assentada e é
+   substituído por geometria de altura absoluta, no nível dos dois encontros.
+2. **Guarda-corpo.** Sem mureta a ponte lê como uma tira de asfalto flutuando. O anel
+   é cortado onde a ponte encontra o resto da pista — senão as entradas fecham e a
+   ponte vira caixa.
+3. **Apoio.** Vão acima de 26 m recebe pilar, do leito escavado até o fundo do
+   tabuleiro. Isso também resolve os **viadutos tagueados**, que ficavam suspensos no
+   ar sem nada embaixo.
+
+Três medidas que custaram uma medição cada:
+
+- **O vão cobre o talude.** Se o tabuleiro parasse na beira da água, a pista assentada
+  ainda desceria a rampa de escavação inteira antes de encontrá-lo, e sobraria um
+  degrau na entrada.
+- **O encontro é amostrado além do talude.** Dentro do talude o terreno já foi
+  rebaixado pela própria água; medir ali dava um tabuleiro na altura do rio em vez da
+  altura da margem — a ponte nascia afundada e o pilar era descartado por não caber
+  embaixo dela.
+- **O encontro é a entrada do próprio tabuleiro, não um anel em volta.** A primeira
+  correção media a altura num anel de pista de 14 m ao redor da travessia, e isso é um
+  erro grosseiro em cidade de montanha: em Ouro Preto o anel pega a ladeira que passa
+  perto do córrego, e o tabuleiro sobe com ela. Medido: **19 de 27 tabuleiros mais de
+  6 m acima do próprio vão**, dois deles a 99 e 121 m no ar. A altura passou a sair da
+  faixa onde o tabuleiro encosta no resto da pista — a única amostra que descreve por
+  onde a pista de fato chega na ponte —, com um teto de 5 m acima da margem como rede
+  de segurança.
+
+Resultado em Ouro Preto, na malha final: **nenhum triângulo de pista ou calçamento
+abaixo da lâmina**, mediana do tabuleiro a 4,6 m acima da água e p90 a 7,7 m.
+
+O limiar de travessia é baixo de propósito (2 m²). A tentação é reservar a ponte para o
+rio de verdade, mas a vala também é escavada — o leito desce 1,05 m seja rio ou valeta
+—, então sem tabuleiro a pista mergulha nela do mesmo jeito. Com o limiar em 10 m²
+sobravam 39 vértices de pista dentro da água, todos em travessias pequenas; um
+tabuleiro de 3 m² custa doze triângulos.
+
+Em Ouro Preto: **23 tabuleiros para 30 travessias** (as vizinhas se fundem num vão só),
+e 1,48 m² de 1338 m² de travessia sem ponte — as três lascas abaixo do limiar, onde uma
+rua apenas roça a esquina de um córrego.
+
+A sinalização horizontal recebeu o mesmo veto. Ela é assentada no relevo como a pista,
+então sobre o rio ela descia com o terreno e reaparecia no fundo, debaixo da lâmina,
+enquanto a pista já tinha subido para a ponte: **47 vértices de pintura submersos**, a
+0,47 m em média da superfície da água. Agora ela não é desenhada sobre água.
+
+## Física: `--colliders`
+
+A malha bonita não serve como colisor. Um prédio tem parede, telhado de quatro águas,
+beiral, janela e platibanda — centenas de triângulos que a física teria de testar a
+cada quadro para responder uma pergunta simples: *"bati na casa?"*. Uma engine responde
+isso com **uma caixa**.
+
+Então a física sai em paralelo, com as formas que ela quer:
+
+| elemento | forma | por quê |
+|---|---|---|
+| edifício | caixa orientada | casa raramente é paralela ao norte; a caixa alinhada ao eixo sobraria |
+| árvore | cilindro no tronco | ninguém esbarra em folha; cercar a copa dobraria o espaço ocupado |
+| chão | campo de altura | formato nativo de terreno em toda engine, e o mais barato que existe |
+| água | volume | serve de gatilho: nadar, afogar, frear |
+
+As formas são anotadas **pelos próprios geradores enquanto constroem o visual**, e não
+por uma segunda leitura do mapa. É o que garante que o colisor bate com o que se vê: a
+caixa do prédio usa a altura que o gerador de fato escolheu.
+
+Duas saídas, porque as engines não concordam:
+
+1. **Malha no próprio GLB**, em nós separados com sufixo configurável — Godot entende
+   `-colonly`, Unreal usa `UCX_`. `glTF não tem física no padrão`, então convenção de
+   nome é o único canal que existe.
+2. **JSON ao lado** (`mapa.colisores.json`) com as formas *analíticas* — centro,
+   tamanho, raio, giro. É o que permite criar colisor **primitivo** na engine em vez de
+   trimesh, que é onde está a diferença de desempenho: uma caixa custa quase nada, uma
+   malha de mil triângulos custa mil vezes mais.
+
+O sidecar de física é um arquivo separado por tamanho: o campo de altura é uma matriz,
+e numa região de alguns km² ela sozinha é maior que todo o resto dos metadados somado.
+
+O material de colisão é **totalmente transparente**, e o viewport e o renderizador o
+ignoram pelo nome. A primeira versão usava vermelho semitransparente "para
+identificar", e o resultado foi a física aparecer por cima do mapa inteiro — que é
+exatamente o que um colisor não deve fazer.
 
 ## Peso da cena
 
@@ -811,8 +1002,8 @@ Dados do OpenStreetMap são ODbL — atribuição obrigatória no que for public
 ```
 mapforge/
   core/         BBox, projeção local, objetos do mapa, MeshBuilder
-  data/         downloader Overpass, cache SQLite, parser OSM
-  generation/   terreno, ruas, prédios, vegetação, água, curvas, orquestrador
+  data/         downloader Overpass, Overture, cache SQLite, parser OSM
+  generation/   terreno, ruas, pontes, prédios, vegetação, água, colisores, orquestrador
   imagery/      tiles de satélite e de elevação, mosaico, amostragem de cores
   styles/       paletas e parâmetros por estilo
   export/       Scene -> GLB/GLTF/OBJ/PLY
@@ -820,6 +1011,8 @@ mapforge/
   ui/           janela PySide6, mapa de seleção (HTML/JS próprio), viewport ModernGL
   preview.py    planta 2D (matplotlib)
   pipeline.py   API de alto nível
+  tiling.py     geração em blocos + manifesto de montagem
+  streaming.py  carregamento dinâmico por anéis de detalhe
   cli.py        linha de comando
 ```
 
@@ -961,9 +1154,10 @@ Do OSM vêm as formas: contorno dos prédios, traçado das ruas, limites de parq
   costuras nos cruzamentos e impede que uma calçada flutue sobre uma avenida.
 - **Água** — o canal é escavado: o terreno é recortado, as margens descem em talude
   até o leito e a lâmina fica abaixo do solo. Cursos d'água são suavizados por
-  Chaikin, o que transforma o traçado quebrado do OSM em meandro. Onde uma via
-  cruza a água, a pista continua no nível do solo e ganha uma laje por baixo — como
-  quem está rebaixado é o rio, a ponte não precisa de rampa.
+  Chaikin, o que transforma o traçado quebrado do OSM em meandro. Rio comprido é
+  fatiado em trechos com nível próprio, que nunca sobe para jusante. Onde uma via
+  cruza a água, o trecho de pista sai da superfície assentada e é substituído por um
+  tabuleiro plano com guarda-corpo e pilares.
 - **Vegetação** — sete espécies (copa arredondada, cônica, pinheiro em camadas,
   cipreste, palmeira, copa de guarda-chuva e arbusto), cada uma com tronco e copa
   próprios porque a proporção muda muito — palmeira é quase só estipe, arbusto quase
@@ -1043,7 +1237,7 @@ O renderizador offscreen é software puro: ~9 s para 77 mil triângulos, ~90 s p
 py -3.11 -m pytest tests -q
 ```
 
-336 testes, sem rede: geometria e winding das malhas, parser (com fixture Overpass),
+482 testes, sem rede: geometria e winding das malhas, parser (com fixture Overpass),
 suavização de eixos, classificação viária, escavação da água, matemática de tiles e
 quadkeys, detecção do tile-placeholder, decodificação Terrarium, exatidão do campo de
 altura, **regressão do assentamento no relevo**, fusão de contornos, classificação de
@@ -1053,6 +1247,16 @@ todas as formas de telhado, todas as espécies de árvore, amostragem de cores,
 determinismo da seed, combinações de estilo × detalhe, fallback entre espelhos do
 Overpass, recorte por contorno desenhado, plano e manifesto da geração em blocos, e
 exportação com reimportação.
+
+Cada defeito medido virou um invariante:
+
+| teste | fixa |
+|---|---|
+| `test_pontes.py` | leito sem ilhas, nível por trecho não sobe para jusante, pista sobre o rio acima da água, tabuleiro plano e na altura da margem, guarda-corpo com as entradas abertas |
+| `test_colliders.py` | a caixa usa a altura que o gerador escolheu, a física não é desenhada, o sidecar sai em arquivo próprio |
+| `test_navegacao.py` | o avanço é horizontal, o passo acompanha a distância, teclas opostas se cancelam |
+| `test_tiling.py` | a referência de altura é a mesma em todos os blocos, a mesma cor de água gera o mesmo material |
+| `test_gaps.py` | a detecção por imagem só vale onde nenhuma fonte de contorno chegou |
 
 ## Limitações conhecidas
 
@@ -1065,7 +1269,11 @@ exportação com reimportação.
   não atravessar o morro.
 - Os arquétipos cobrem o que o OSM declara. Onde ninguém marcou `amenity=*`, o prédio
   continua genérico — e é o caso da maioria.
-- Viadutos tagueados ficam suspensos sem pilares.
+- O tabuleiro do viaduto tagueado continua acompanhando o relevo (fica a uma altura
+  constante acima do terreno) em vez de vencer o vão em linha reta; os pilares agora
+  o apoiam, mas um viaduto sobre terreno muito acidentado ainda ondula.
+- Travessia de água abaixo de 2 m² não ganha tabuleiro: ali a pista continua assentada
+  e desce o pouco que o leito foi escavado. Em Ouro Preto isso é 1,48 m² de 1338 m².
 - Telhado de duas águas usa a caixa orientada mínima do contorno: fica correto em
   plantas retangulares, aproximado nas demais (por isso a troca automática para
   piramidal ou plano quando a forma é irregular).
@@ -1091,7 +1299,7 @@ exportação com reimportação.
   do perfil regional por latitude e a altura é sorteada na faixa da espécie.
 - O dossel é uma superfície, não árvores: visto de perto e de baixo ele denuncia que
   é uma casca. Ele existe para a vista de cima e média distância, que é para o que
-  este gerador serve. Use `--no-canopy-shell` se a câmera vai entrar na mata.
+  este gerador serve — por isso ele fica desligado por padrão (`--canopy-shell` liga).
 - A primeira consulta ao Overture numa região leva de 20 s a 2 min, dependendo da
   latência do S3. Só a primeira: depois é cache.
 - A detecção por imagem devolve retângulos orientados, não contornos exatos, e não

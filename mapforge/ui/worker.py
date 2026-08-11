@@ -65,6 +65,7 @@ class GenerationWorker(QThread):
         kind: str = "generate",
         render_camera: Optional[dict] = None,
         clip_polygon=None,
+        diagnostic_log: Optional[Path] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -74,6 +75,8 @@ class GenerationWorker(QThread):
         self.kind = kind
         self.render_camera = render_camera or {}
         self.clip_polygon = clip_polygon
+        # Arquivo da sessao de diagnostico, quando ligada no painel.
+        self.diagnostic_log = diagnostic_log
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -175,6 +178,22 @@ class GenerationWorker(QThread):
                 note=note,
             )
         )
+
+        # O retrato da cena sai **depois** de a cena chegar ao viewport.
+        #
+        # Ele rasteriza a cena inteira, e numa regiao grande isso leva dezenas de
+        # segundos. Rodando antes do `succeeded`, a interface ficava "carregando"
+        # muito depois de o modelo estar pronto e exportado - foi o defeito
+        # relatado. Aqui o mapa aparece na hora e o log se completa em seguida.
+        if self.diagnostic_log is not None:
+            try:
+                from ..diagnostics import registrar_geracao
+
+                self.progressed.emit("anotando o diagnostico (o mapa ja esta pronto)", 1.0)
+                registrar_geracao(self.diagnostic_log, self.bbox, self.settings, result)
+                self.progressed.emit(f"diagnostico gravado em {self.diagnostic_log}", 1.0)
+            except Exception as exc:  # noqa: BLE001 - diagnostico nao derruba a cena
+                log.warning("Diagnostico falhou: %s", exc)
 
 
 class RenderWorker(QThread):
