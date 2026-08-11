@@ -134,9 +134,13 @@ class MeshBuilder:
     relevo em vez de ficarem no plano z=0.
     """
 
-    def __init__(self, terrain=None, clip=None) -> None:
+    def __init__(self, terrain=None, clip=None, log=None) -> None:
         self._groups: dict[str, _Group] = {}
         self.terrain = terrain
+        # Registro de procedencia (mapforge.diagnostics.GeometryLog) ou None.
+        # Ligado, anota qual gerador produziu cada lote de triangulos - e o que
+        # permite responder "de onde saiu essa chapa?" sem adivinhar.
+        self.log = log
         # Contorno da regiao, quando ela foi desenhada a mao. As superficies sao
         # recortadas por ele na hora de virar malha: o parser recorta o *eixo*
         # da via, mas a largura e aplicada depois, entao sem isto a calcada
@@ -287,6 +291,11 @@ class MeshBuilder:
             group = self._groups[material.name] = _Group(material)
         if uv is not None:
             uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+        # O gancho fica aqui porque `add_mesh` e o funil: add_flat, add_walls,
+        # add_prism, add_slope e add_instances todos desembocam nele. Uma linha
+        # cobre a cena inteira.
+        if self.log is not None:
+            self.log.record(material.name, vertices, faces)
         group.append(vertices, faces, uv)
 
     def add_quad(
