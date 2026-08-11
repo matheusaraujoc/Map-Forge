@@ -20,6 +20,7 @@ from shapely.ops import unary_union
 from ..core.features import Road, RoadClass
 from ..core.mesh import Material, MeshBuilder
 from . import layers
+from .bridges import build_viaduct_supports, build_water_bridges
 from .context import GenerationContext
 from .curves import offset_polyline, smooth_road
 
@@ -161,26 +162,46 @@ def _drape(builder: MeshBuilder, vertices: np.ndarray) -> np.ndarray:
     return vertices + [0.0, 0.0, builder.drape_bias]
 
 
-def _emit(builder: MeshBuilder, material: Material, vertices: np.ndarray, faces: np.ndarray) -> None:
+def _emit(
+    builder: MeshBuilder,
+    material: Material,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    avoid=None,
+) -> None:
     """Assenta e envia uma malha ja triangulada, respeitando o contorno.
 
     A sinalizacao e construida como faixas prontas, sem passar por add_flat,
     entao o recorte da regiao desenhada precisa ser aplicado aqui - senao a
     pintura de solo avanca alguns metros para fora do terreno.
+
+    `avoid` e a area onde a faixa nao pode ser desenhada. Serve a agua: a
+    sinalizacao e assentada no relevo, e sobre um rio o relevo e o **leito
+    escavado**, entao a faixa central acompanhava a pista para dentro do rio e
+    reaparecia no fundo, debaixo da lamina. Medido em Ouro Preto: 47 vertices de
+    pintura submersos, a 0,47 m em media da superficie da agua.
     """
     vertices = _drape(builder, vertices)
-    if builder.clip is not None and len(faces):
+    if len(faces):
         import shapely
 
-        # Exige os tres vertices dentro: testar o centroide deixaria a metade
-        # externa de um triangulo que cruza a borda passar.
-        pontos = vertices[faces]
-        dentro = shapely.contains_xy(
-            builder.clip, pontos[:, :, 0].ravel(), pontos[:, :, 1].ravel()
-        ).reshape(len(faces), 3)
-        faces = faces[dentro.all(axis=1)]
-        if not len(faces):
-            return
+        def _cantos_dentro(corte):
+            pontos = vertices[faces]
+            return shapely.contains_xy(
+                corte, pontos[:, :, 0].ravel(), pontos[:, :, 1].ravel()
+            ).reshape(len(faces), 3)
+
+        # O contorno da regiao mantem o triangulo com os **tres** cantos dentro;
+        # a area proibida descarta o que tiver **qualquer** canto dentro. Testar
+        # o centroide deixaria passar metade de um triangulo que cruza a borda.
+        if builder.clip is not None:
+            faces = faces[_cantos_dentro(builder.clip).all(axis=1)]
+            if not len(faces):
+                return
+        if avoid is not None and not avoid.is_empty:
+            faces = faces[~_cantos_dentro(avoid).any(axis=1)]
+            if not len(faces):
+                return
 
         # Compacta: sem isto os vertices das faces descartadas continuariam no
         # buffer, sem triangulo nenhum, e viajariam ate o arquivo exportado.
@@ -283,6 +304,7 @@ def _add_crossing(
     material: Material,
     line: LineString,
     coords: np.ndarray,
+    avoid=None,
 ) -> None:
     """Faixa de pedestre: barras paralelas ao sentido da travessia."""
     from shapely.ops import substring
@@ -306,7 +328,7 @@ def _add_crossing(
         outer = offset_polyline(coords, offset + bar_half)
         strip = _flat_strip(inner, outer, layers.Z_ROAD_LINE)
         if strip is not None:
-            _emit(builder, material, strip[0], strip[1])
+            _emit(builder, material, strip[0], strip[1], avoid=avoid)
 
 
 def _add_markings(
@@ -315,6 +337,7 @@ def _add_markings(
     road: Road,
     coords: np.ndarray,
     half_width: float,
+    avoid=None,
 ) -> None:
     spec = ROAD_SPECS[road.road_class]
     z = layers.Z_ROAD_LINE
@@ -324,7 +347,7 @@ def _add_markings(
         quads = _dashes(coords, line_width=0.14)
         if quads is not None:
             verts, faces = _quads_to_mesh(quads, z)
-            _emit(builder, material, verts, faces)
+            _emit(builder, material, verts, faces, avoid=avoid)
 
     # Faixas de bordo continuas.
     if spec.edge_lines and half_width >= 3.0:
@@ -335,7 +358,7 @@ def _add_markings(
             outer = offset_polyline(coords, distance + 0.06)
             strip = _flat_strip(inner, outer, z)
             if strip is not None:
-                _emit(builder, material, strip[0], strip[1])
+                _emit(builder, material, strip[0], strip[1], avoid=avoid)
 
 
 # ------------------------------------------------------------------ pipeline
@@ -419,6 +442,11 @@ def generate_roads(
                 sidewalk_extents.append(walk)
 
     # --- pistas no solo, em ordem de prioridade ---
+    #
+    # A geometria e resolvida antes de virar malha porque a ponte precisa entrar
+    # no meio: o trecho de pista sobre a agua sai daqui e e substituido por um
+    # tabuleiro plano. Assentar primeiro e corrigir depois nao funciona - a
+    # pista ja teria descido dentro do leito escavado.
     merged_by_key: dict[str, object] = {}
     covered = None
     for key in SURFACE_PRIORITY:
@@ -434,17 +462,49 @@ def generate_roads(
         if merged.is_empty:
             continue
         merged_by_key[key] = merged
-        builder.add_flat(materials[key], merged, layers.Z_ROAD, drape=ctx.draped)
         covered = merged if covered is None else unary_union([covered, merged])
 
     surface_union = covered
+
+    # --- pontes sobre agua ---
+    bridge_union = None
+    if ctx.settings.water and water_union is not None and surface_union is not None:
+        try:
+            bridge_union = build_water_bridges(
+                builder,
+                ctx,
+                surface_union,
+                water_union,
+                {materials[k]: g for k, g in merged_by_key.items()},
+                materials["road"],
+            )
+        except Exception as exc:  # noqa: BLE001 - sem ponte a cena ainda fecha
+            log.warning("Geracao de pontes falhou: %s", exc)
+
+    # --- pistas assentadas, ja sem o vao das pontes ---
+    for key in SURFACE_PRIORITY:
+        merged = merged_by_key.get(key)
+        if merged is None:
+            continue
+        if bridge_union is not None:
+            try:
+                merged = merged.difference(bridge_union)
+            except Exception:  # noqa: BLE001 - mantem a superficie cheia
+                pass
+        if merged.is_empty:
+            continue
+        builder.add_flat(materials[key], merged, layers.Z_ROAD, drape=ctx.draped)
 
     # --- calcadas: faixa lateral elevada, o degrau ja e o meio-fio ---
     paved_union = surface_union
     if sidewalk_extents and surface_union is not None:
         extent = ctx.simplify(unary_union(sidewalk_extents))
         sidewalk = extent
-        for cut in (surface_union, building_union):
+        # A agua entra no recorte junto com a pista: a faixa de calcada e mais
+        # larga que o asfalto, entao sobre um rio ela sobrava para os lados do
+        # tabuleiro e mergulhava no leito escavado - a mesma falha da pista, so
+        # que sem ponte para substitui-la.
+        for cut in (surface_union, building_union, water_union):
             if cut is None or cut.is_empty:
                 continue
             try:
@@ -474,22 +534,23 @@ def generate_roads(
         paved_union = extent
 
     # --- sinalizacao horizontal ---
+    #
+    # A pintura e assentada no relevo, e sobre um rio o relevo e o leito
+    # escavado. Sem este veto ela desce dentro da agua junto com o terreno,
+    # enquanto a pista ja subiu para a ponte.
+    sem_pintura = water_union if ctx.settings.water else None
     for road, coords, half in marking_jobs:
         try:
-            _add_markings(builder, palette.road_line, road, coords, half)
+            _add_markings(builder, palette.road_line, road, coords, half, avoid=sem_pintura)
         except Exception as exc:  # noqa: BLE001 - sinalizacao e cosmetica
             log.debug("Sinalizacao ignorada em %s: %s", road.osm_id, exc)
 
     if ctx.detail["road_markings"]:
         for line, coords in crossings:
             try:
-                _add_crossing(builder, palette.road_line, line, coords)
+                _add_crossing(builder, palette.road_line, line, coords, avoid=sem_pintura)
             except Exception as exc:  # noqa: BLE001
                 log.debug("Faixa de pedestre ignorada: %s", exc)
-
-    # --- laje sob os trechos que atravessam agua ---
-    if water_union is not None and surface_union is not None:
-        _add_deck_over_water(builder, ctx, surface_union, water_union)
 
     # --- viadutos e pontes tagueadas ---
     for z, key, surface in elevated:
@@ -504,42 +565,14 @@ def generate_roads(
             top_material=materials[key],
             drape=ctx.draped,
         )
+    if elevated:
+        try:
+            build_viaduct_supports(builder, ctx, elevated)
+        except Exception as exc:  # noqa: BLE001 - o tabuleiro ja esta desenhado
+            log.warning("Pilares de viaduto falharam: %s", exc)
 
     return RoadResult(
         surface_union=surface_union, paved_union=paved_union, centerlines=centerlines
-    )
-
-
-def _add_deck_over_water(builder: MeshBuilder, ctx: GenerationContext, roads_union, water_union):
-    """Laje de ponte onde a pista cruza agua.
-
-    A pista permanece no nivel do solo - quem esta rebaixado e o rio -, entao
-    basta fechar o vao por baixo. Sem necessidade de rampas de acesso.
-    """
-    try:
-        crossing = roads_union.intersection(water_union)
-    except Exception:  # noqa: BLE001 - topologia ruim
-        return
-    if crossing.is_empty:
-        return
-
-    # Avanca sobre as margens para a laje apoiar em terra firme.
-    try:
-        deck = crossing.buffer(layers.DECK_OVERHANG, quad_segs=1, join_style=2)
-        deck = deck.intersection(roads_union)
-    except Exception:  # noqa: BLE001
-        return
-    if deck.is_empty:
-        return
-
-    builder.add_prism(
-        ctx.palette.curb,
-        ctx.simplify(deck),
-        layers.Z_ROAD - layers.DECK_THICKNESS,
-        layers.Z_ROAD - 0.01,
-        cap_top=False,
-        cap_bottom=True,
-        drape=ctx.draped,
     )
 
 

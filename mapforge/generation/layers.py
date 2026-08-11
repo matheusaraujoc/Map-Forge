@@ -23,10 +23,17 @@ Z_CURB = 0.16
 # --- estruturas elevadas ---
 Z_BRIDGE = 5.00
 Z_BRIDGE_DECK = 0.55
-# Ponte de nivel: a pista segue no nivel do solo e ganha uma laje por baixo,
-# porque quem esta rebaixado e o rio. Nao precisa de rampa.
+
+# Espessura do tabuleiro da ponte.
+#
+# O comentario que estava aqui dizia que a pista segue no nivel do solo e so
+# ganha uma laje por baixo, "porque quem esta rebaixado e o rio, entao nao
+# precisa de rampa". Isso vale no terreno plano e e **falso com relevo**: ali a
+# pista e assentada no terreno, e o terreno debaixo do rio acabou de ser
+# escavado - a pista descia junto e atravessava o fundo. Quem constroi a ponte
+# hoje e `generation/bridges.py`, com altura absoluta; o quanto o tabuleiro
+# avanca sobre as margens e decidido la, em funcao da largura do talude.
 DECK_THICKNESS = 0.65
-DECK_OVERHANG = 4.0  # quanto a laje avanca sobre as margens
 
 # Deslocamento por nivel (tag layer=*) para viadutos empilhados.
 LAYER_STEP = 4.5
