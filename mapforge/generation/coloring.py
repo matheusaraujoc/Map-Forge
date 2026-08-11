@@ -111,6 +111,33 @@ def build_area_materials(ctx, map_data) -> dict[str, dict[int, Material]]:
     }
 
 
+# Passo do reticulado de cor da agua, por canal (0 a 1).
+#
+# Grosso de proposito: 15 niveis por canal. A cor de um rio varia pouco de um
+# ponto a outro dele, entao um passo grande junta as amostras do mesmo rio numa
+# celula so, e e isso que se quer.
+WATER_COLOR_STEP = 1.0 / 15.0
+
+
+def _water_cell(color) -> tuple[int, int, int]:
+    """Celula do reticulado de cor a que uma amostra de agua pertence.
+
+    Substitui o k-means que havia aqui, e a razao e a montagem por blocos.
+    O k-means agrupa **as amostras que recebeu**: cada bloco via so os seus
+    corpos d'agua, achava centros diferentes e batizava todos de `water_sat_00`,
+    `water_sat_01`... Resultado: o mesmo rio saia com uma cor em um bloco e
+    outra no bloco vizinho, e a emenda aparecia como troca abrupta de cor no
+    meio do rio - foi o defeito relatado na geracao de regiao grande.
+
+    Um reticulado fixo nao depende do que se viu: a mesma cor cai sempre na
+    mesma celula, e o nome do material sai da celula. Dois blocos que amostram o
+    mesmo rio produzem o mesmo material, e a montagem fecha.
+    """
+    return tuple(
+        int(round(max(0.0, min(1.0, float(c))) / WATER_COLOR_STEP)) for c in color
+    )
+
+
 def build_water_materials(ctx, waters, rivers) -> dict[int, Material]:
     """Cor real de cada corpo d'agua.
 
@@ -152,25 +179,32 @@ def build_water_materials(ctx, waters, rivers) -> dict[int, Material]:
     if not amostras:
         return {}
 
-    ids = list(amostras)
-    labels, centers = quantize(
-        np.array([amostras[i] for i in ids]), 5, seed=ctx.settings.seed
-    )
     amount = ctx.settings.area_blend
-    materiais = [
-        Material(
-            name=f"water_sat_{i:02d}",
-            color=blend(palette.style.water, tuple(float(c) for c in centro), amount),
-            # Os mesmos parametros do material de agua do estilo: sem eles a agua
-            # amostrada perderia o brilho e a transparencia e viraria chapa azul.
-            roughness=0.15,
-            metallic=0.1,
-            opacity=palette.style.water_opacity,
-        )
-        for i, centro in enumerate(centers)
-    ]
-    log.info("Agua: %d corpos em %d cores", len(amostras), len(centers))
-    return {osm_id: materiais[labels[n]] for n, osm_id in enumerate(ids)}
+    materiais: dict[tuple[int, int, int], Material] = {}
+    saida: dict[int, Material] = {}
+
+    for osm_id, cor in amostras.items():
+        celula = _water_cell(cor)
+        material = materiais.get(celula)
+        if material is None:
+            centro = tuple(float(i) * WATER_COLOR_STEP for i in celula)
+            material = materiais[celula] = Material(
+                # O nome sai da propria cor, e nao de um indice de agrupamento.
+                # E o que faz o mesmo rio ter o mesmo material em blocos
+                # diferentes - ver a nota em `_water_cell`.
+                name="water_sat_%02d%02d%02d" % celula,
+                color=blend(palette.style.water, centro, amount),
+                # Os mesmos parametros do material de agua do estilo: sem eles a
+                # agua amostrada perderia o brilho e a transparencia e viraria
+                # chapa azul.
+                roughness=0.15,
+                metallic=0.1,
+                opacity=palette.style.water_opacity,
+            )
+        saida[osm_id] = material
+
+    log.info("Agua: %d corpos em %d cores", len(amostras), len(materiais))
+    return saida
 
 
 def build_road_materials(ctx, roads) -> dict[str, Material]:

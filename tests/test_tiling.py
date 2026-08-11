@@ -169,3 +169,70 @@ def test_resultado_conta_apenas_blocos_gerados():
     )
     assert len(resultado.ok) == 1
     assert resultado.triangles == 10
+
+
+# ------------------------------------------------- montagem: rio na divisa
+#
+# Dois defeitos que so aparecem quando os blocos sao postos lado a lado, e que
+# ambos se manifestam no rio - a feicao mais longa que atravessa a emenda.
+
+
+def test_a_referencia_de_altura_e_a_mesma_em_todos_os_blocos():
+    """Sem isso o relevo salta na divisa e o rio aparece em duas alturas.
+
+    Cada `TerrainField` normaliza subtraindo o minimo do proprio recorte. Numa
+    cena unica isso e certo; em blocos, dois vizinhos tem minimos diferentes e o
+    mesmo ponto do terreno recebe z diferente nos dois.
+    """
+    import numpy as np
+
+    from mapforge.generation.terrain import TerrainField
+    from mapforge.imagery.elevation import ElevationGrid
+
+    oeste = BBox(-2.9418, -41.7932, -2.9200, -41.7700)
+    leste = BBox(-2.9418, -41.7700, -2.9200, -41.7468)
+
+    # O mesmo terreno inclinado, visto por dois recortes de altitudes diferentes.
+    def campo(bbox, alturas, base=None):
+        grade = ElevationGrid(heights=alturas, bbox=bbox, zoom=15)
+        return TerrainField.from_grid(bbox, grade, step=40.0, base=base)
+
+    baixo = np.tile(np.linspace(100.0, 140.0, 20), (20, 1))
+    alto = np.tile(np.linspace(140.0, 180.0, 20), (20, 1))
+
+    # Sem base compartilhada: os dois blocos comecam do proprio zero.
+    a, b = campo(oeste, baixo), campo(leste, alto)
+    assert a.base != b.base
+    assert a.z.max() == pytest.approx(b.z.max(), abs=1e-6)  # o degrau some no z
+
+    # Com base compartilhada, a diferenca real de 40 m reaparece.
+    referencia = float(min(baixo.min(), alto.min()))
+    a, b = campo(oeste, baixo, referencia), campo(leste, alto, referencia)
+    assert a.base == b.base == referencia
+    assert b.z.max() - a.z.max() == pytest.approx(40.0, abs=1e-6)
+
+
+def test_a_base_compartilhada_e_repassada_aos_blocos():
+    from dataclasses import replace
+
+    settings = replace(GenerationSettings(elevation=True), elevation_base=12.5)
+    assert settings.to_dict()["elevation_base"] == 12.5
+    assert GenerationSettings().elevation_base is None
+
+
+def test_a_mesma_cor_de_agua_gera_o_mesmo_material_em_qualquer_bloco():
+    """O k-means agrupava so o que cada bloco via, e o rio trocava de cor na
+    emenda. O reticulado fixo nao depende da amostra."""
+    from mapforge.generation.coloring import _water_cell
+
+    rio = (0.33, 0.48, 0.49)
+    # Dois blocos amostram o mesmo rio com uma diferenca pequena de iluminacao.
+    assert _water_cell(rio) == _water_cell((0.335, 0.478, 0.492))
+    # Agua claramente diferente continua em celulas diferentes.
+    assert _water_cell(rio) != _water_cell((0.10, 0.12, 0.11))
+
+
+def test_a_celula_de_cor_da_agua_aguenta_valores_fora_da_faixa():
+    from mapforge.generation.coloring import _water_cell
+
+    assert _water_cell((-0.2, 0.5, 1.4)) == _water_cell((0.0, 0.5, 1.0))

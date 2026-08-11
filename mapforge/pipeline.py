@@ -27,6 +27,8 @@ class GenerationResult:
     settings: GenerationSettings
     output: Optional[Path] = None
     imagery: object | None = None  # GeoImage, quando o satelite esta ligado
+    # Procedencia da geometria (diagnostics.GeometryLog), com `diagnose=True`.
+    geometry_log: object | None = None
 
 
 def _stage(progress: Optional[ProgressFn], start: float, span: float) -> ProgressFn:
@@ -325,6 +327,7 @@ def generate(
             elevation_grid,
             step=GRID_STEP[settings.detail],
             exaggeration=settings.elevation_exaggeration,
+            base=settings.elevation_base,
         )
 
     ctx = GenerationContext(
@@ -360,7 +363,8 @@ def generate(
         }
 
     result = GenerationResult(
-        bbox=bbox, map_data=map_data, scene=scene, settings=settings, imagery=imagery
+        bbox=bbox, map_data=map_data, scene=scene, settings=settings, imagery=imagery,
+        geometry_log=ctx.geometry_log,
     )
 
     if output:

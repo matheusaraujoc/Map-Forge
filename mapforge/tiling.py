@@ -143,6 +143,50 @@ def _group_tiles(plano, region: BBox, cols: int, rows: int):
     return grupos
 
 
+def _share_elevation_base(
+    settings: GenerationSettings, region: BBox, cache, progress: Optional[ProgressFn]
+) -> GenerationSettings:
+    """Fixa a mesma altitude de referencia (z = 0) para a regiao inteira.
+
+    Cada `TerrainField` normaliza as alturas subtraindo o **minimo do proprio
+    recorte**. Numa cena unica isso e certo e mantem as coordenadas pequenas. Na
+    geracao em blocos e a origem de um defeito que so aparece na montagem: dois
+    blocos vizinhos tem minimos diferentes, entao o mesmo ponto do terreno recebe
+    z diferente nos dois, o relevo salta na divisa e o rio que atravessa a emenda
+    aparece em duas alturas.
+
+    A correcao e medir o minimo uma vez, na regiao toda, e passar o mesmo valor a
+    todos os blocos. Se a medicao falhar, cada bloco volta a usar o proprio
+    minimo - torto, mas gerando.
+    """
+    if not settings.elevation or settings.elevation_base is not None:
+        return settings
+
+    from dataclasses import replace
+
+    from .imagery.elevation import fetch_elevation
+
+    try:
+        if progress:
+            progress("medindo a referencia de altura da regiao inteira", 0.0)
+        grade = fetch_elevation(
+            region, cache=cache, zoom=settings.elevation_zoom, smooth=settings.elevation_smooth
+        )
+        if cache is not None:
+            cache.flush_tiles()
+        base = float(grade.min)
+    except Exception as exc:  # noqa: BLE001 - cada bloco usa o proprio minimo
+        log.warning(
+            "Referencia de altura da regiao indisponivel (%s): os blocos podem "
+            "nao casar na divisa",
+            exc,
+        )
+        return settings
+
+    log.info("Referencia de altura compartilhada entre os blocos: %.1f m", base)
+    return replace(settings, elevation_base=base)
+
+
 def _download_groups(grupos, cache, progress: Optional[ProgressFn]):
     """Baixa o OSM de cada super-bloco. Devolve bloco -> dado bruto."""
     from .data import download_region
@@ -204,6 +248,10 @@ def generate_tiled(
     started = time.perf_counter()
 
     try:
+        # A referencia de altura tem de ser a mesma nos blocos todos, senao a
+        # divisa vira degrau e um rio muda de nivel no meio.
+        settings = _share_elevation_base(settings, region, cache, progress)
+
         # Um download por super-bloco, nao por bloco. Sao os downloads que
         # dominam o relogio: 6 blocos de 1,5 km levavam 583 s, quase tudo
         # esperando o Overpass responder seis vezes a mesma vizinhanca.

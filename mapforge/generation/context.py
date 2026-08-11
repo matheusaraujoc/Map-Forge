@@ -164,6 +164,24 @@ class GenerationSettings:
     elevation_zoom: Optional[int] = None
     elevation_exaggeration: float = 1.0
     elevation_smooth: int = 1
+    # Altitude real que corresponde a z = 0. None = o minimo do proprio bloco.
+    # Na geracao em blocos ela e fixada para a regiao inteira: sem isso cada
+    # bloco tem a sua propria referencia de altura e o relevo nao casa na divisa.
+    elevation_base: Optional[float] = None
+
+    # --- fisica ---
+    # Malha de colisao em formas simples (caixa por predio, cilindro por arvore,
+    # campo de altura para o chao) em nos proprios, mais um JSON com as formas
+    # analiticas. Desligada por padrao: o mapa e so o visual ate alguem pedir.
+    colliders: bool = False
+    # Convencao de nome que a engine reconhece na importacao.
+    collider_naming: str = "godot"
+
+    # --- diagnostico ---
+    # Anota qual gerador produziu cada lote de triangulos. E o que responde
+    # "de onde saiu essa geometria?" sem adivinhacao. Custa uma leitura de pilha
+    # por lote, entao fica desligado por padrao.
+    diagnose: bool = False
 
     def __post_init__(self) -> None:
         if self.detail not in DETAIL_LEVELS:
@@ -238,6 +256,24 @@ class GenerationContext:
         # Poligono de recorte em metros locais, quando a regiao foi desenhada a
         # mao em vez de escolhida como retangulo. None = a bbox inteira.
         self.clip = clip
+
+        # --- fisica ---
+        # Os geradores anotam aqui a forma de colisao de cada objeto enquanto
+        # constroem o visual. E o que garante que o colisor case com o que se ve:
+        # a caixa do predio usa a altura que o gerador de fato escolheu, e nao
+        # uma segunda estimativa que poderia divergir.
+        # (contorno, z da base, z do topo da parede)
+        self.collider_boxes: list = []
+        # (x, y, z da base, altura, raio)
+        self.collider_cylinders: list = []
+        self.collider_set = None
+
+        # Procedencia da geometria, quando o diagnostico esta ligado.
+        self.geometry_log = None
+        if self.settings.diagnose:
+            from ..diagnostics import GeometryLog
+
+            self.geometry_log = GeometryLog()
 
         if self.settings.windows is not None:
             self.detail["windows"] = self.settings.windows

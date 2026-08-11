@@ -55,7 +55,16 @@ class TerrainField:
         grid,
         step: float,
         exaggeration: float = 1.0,
+        base: Optional[float] = None,
     ) -> "TerrainField":
+        """Malha de alturas a partir de um DEM.
+
+        `base` e a altitude real que corresponde a z = 0. Quando omitida, cada
+        campo usa o proprio minimo - o que e certo para uma cena unica e **errado
+        na geracao em blocos**: dois blocos vizinhos passam a ter referencias de
+        altura diferentes, e um rio que atravessa a divisa muda de altura no
+        meio. Informar a mesma base para a regiao inteira alinha os blocos.
+        """
         half_w, half_h = bbox.width_m / 2.0, bbox.height_m / 2.0
 
         step = max(float(step), MIN_USEFUL_STEP, grid.meters_per_pixel * 0.9)
@@ -78,7 +87,7 @@ class TerrainField:
         mesh_x, mesh_y = np.meshgrid(xs, ys)
         heights = grid.sample(mesh_x.ravel(), mesh_y.ravel()).reshape(ny, nx)
 
-        base = float(np.min(heights))
+        base = float(np.min(heights)) if base is None else float(base)
         return cls(xs=xs, ys=ys, z=(heights - base) * exaggeration, base=base)
 
     # ------------------------------------------------------------------ consulta
@@ -125,12 +134,41 @@ class TerrainField:
         return float(samples.min())
 
     def level_over(self, geometry, percentile: float = 20.0) -> float:
-        """Altura representativa de uma area - usada como nivel de agua."""
+        """Altura representativa de uma area - usada como nivel de agua.
+
+        As amostras saem de **dentro** do poligono, nao da caixa envolvente.
+        Um rio diagonal preenche uma fracao pequena da propria caixa - medido em
+        Araioses, a caixa tem cinco vezes a area do rio -, entao amostrar a caixa
+        e amostrar sobretudo a encosta em volta, e o nivel da agua saia alto
+        demais. E dai que vinha a "imprecisao" do rio.
+        """
+        from shapely import contains_xy
+
         minx, miny, maxx, maxy = geometry.bounds
-        xs = np.linspace(minx, maxx, 12)
-        ys = np.linspace(miny, maxy, 12)
+        xs = np.linspace(minx, maxx, 24)
+        ys = np.linspace(miny, maxy, 24)
         mesh_x, mesh_y = np.meshgrid(xs, ys)
-        return float(np.percentile(self.height(mesh_x.ravel(), mesh_y.ravel()), percentile))
+        plano_x, plano_y = mesh_x.ravel(), mesh_y.ravel()
+
+        try:
+            dentro = contains_xy(geometry, plano_x, plano_y)
+        except Exception:  # noqa: BLE001 - topologia ruim: usa a caixa inteira
+            dentro = np.ones(len(plano_x), dtype=bool)
+
+        if dentro.sum() >= 6:
+            return float(np.percentile(self.height(plano_x[dentro], plano_y[dentro]), percentile))
+
+        # Corpo estreito demais para a grade acertar (corrego de 3 m de largura):
+        # o proprio contorno e a melhor amostra que existe dele.
+        borda = getattr(geometry, "boundary", None)
+        if borda is not None and not borda.is_empty:
+            coords = np.asarray(
+                [c for linha in getattr(borda, "geoms", [borda]) for c in linha.coords],
+                dtype=np.float64,
+            )
+            if len(coords) >= 2:
+                return float(np.percentile(self.height(coords[:, 0], coords[:, 1]), percentile))
+        return float(np.percentile(self.height(plano_x, plano_y), percentile))
 
     # ------------------------------------------------------------------ escavar
 
@@ -155,46 +193,71 @@ class TerrainField:
         proporcionalmente a quanta margem ele tem para dentro. A transicao
         passa a acompanhar o poligono e nao a grade, e a curva volta a ser
         curva.
+
+        **Dentro do poligono o peso e 1, sempre.** A primeira versao desta rampa
+        dava peso 0,5 na borda interna e crescia para 1 no miolo, "para suavizar
+        os dois lados". O efeito foi o defeito relatado: um vertice logo dentro
+        da margem descia so metade do caminho, e num terreno 2 m acima do leito
+        ele parava **acima da lamina** - ilhota de terra no meio do rio. Medido
+        em Araioses, num rio so: 245 vertices acima da agua, o mais alto por
+        1,82 m. Quem tem de ser gradual e o lado de fora, que e o talude; o
+        leito e leito.
         """
         import shapely
         from shapely import contains_xy
 
         if geometry is None or geometry.is_empty:
             return
-        mesh_x, mesh_y = np.meshgrid(self.xs, self.ys)
-        planos_x, planos_y = mesh_x.ravel(), mesh_y.ravel()
-        dentro = contains_xy(geometry, planos_x, planos_y)
 
         target = (self.level_over(geometry) if level is None else level) - depth
 
         # A rampa cobre mais de uma celula de proposito: com menos que isso ela
         # nao tem vertice onde acontecer e o degrau volta.
         banda = bank_m if bank_m is not None else max(self.step * 1.6, 6.0)
+
+        # So os vertices na vizinhanca do corpo entram na conta. Sem este recorte
+        # cada trecho de rio percorreria a grade inteira, e o nivel por trecho
+        # (varios `carve` por corpo) multiplicaria esse custo pelo numero de
+        # trechos.
+        mesh_x, mesh_y = np.meshgrid(self.xs, self.ys)
+        planos_x, planos_y = mesh_x.ravel(), mesh_y.ravel()
+        minx, miny, maxx, maxy = geometry.bounds
+        margem = banda + self.step
+        perto = (
+            (planos_x >= minx - margem)
+            & (planos_x <= maxx + margem)
+            & (planos_y >= miny - margem)
+            & (planos_y <= maxy + margem)
+        )
+        if not perto.any():
+            return
+        alvo_x, alvo_y = planos_x[perto], planos_y[perto]
+        dentro = contains_xy(geometry, alvo_x, alvo_y)
+
         try:
-            distancia = shapely.distance(
-                shapely.points(planos_x, planos_y), geometry.boundary
-            )
+            distancia = shapely.distance(shapely.points(alvo_x, alvo_y), geometry.boundary)
         except Exception:  # noqa: BLE001 - topologia ruim: cai no teste binario
             if dentro.any():
-                achatado = self.z.ravel()
-                achatado[dentro] = np.minimum(achatado[dentro], target)
+                achatado = self.z.ravel().copy()
+                indices = np.nonzero(perto)[0][dentro]
+                achatado[indices] = np.minimum(achatado[indices], target)
                 self.z = achatado.reshape(self.z.shape)
             return
 
-        # Dentro: desce cheio no miolo e menos perto da borda.
-        # Fora: ainda desce um pouco, formando o talude - e o que faz a margem
-        # encostar na agua em vez de terminar em parede.
-        peso = np.where(
-            dentro,
-            np.clip(distancia / banda, 0.0, 1.0) * 0.5 + 0.5,
-            np.clip(1.0 - distancia / banda, 0.0, 1.0) * 0.5,
-        )
+        # Dentro: leito, desce inteiro. Fora: talude, desce cada vez menos ate
+        # `banda`. A curva suave (3t^2 - 2t^3) tira o vinco que a rampa reta
+        # deixava na crista da margem.
+        fora = np.clip(1.0 - distancia / banda, 0.0, 1.0)
+        fora = fora * fora * (3.0 - 2.0 * fora)
+        peso = np.where(dentro, 1.0, fora)
         if not np.any(peso > 0.0):
             return
 
         achatado = self.z.ravel().copy()
-        rebaixado = achatado * (1.0 - peso) + target * peso
-        self.z = np.minimum(achatado, rebaixado).reshape(self.z.shape)
+        indices = np.nonzero(perto)[0]
+        atual = achatado[indices]
+        achatado[indices] = np.minimum(atual, atual * (1.0 - peso) + target * peso)
+        self.z = achatado.reshape(self.z.shape)
 
     # -------------------------------------------------------------------- malha
 

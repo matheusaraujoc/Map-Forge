@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 from shapely.ops import unary_union
 
 from ..core.mesh import MeshBuilder
@@ -181,12 +182,107 @@ def _material_for(ctx, body, por_id):
     return ctx.palette.water
 
 
+# Comprimento de um trecho de rio, em metros.
+#
+# Um nivel unico por corpo d'agua so funciona em lago. Num rio de 900 m descendo
+# um vale, a lamina plana ou flutua acima do terreno na cabeceira ou fica
+# enterrada na foz. O corpo e fatiado ao longo do proprio eixo e cada trecho
+# ganha o seu nivel.
+REACH_M = 140.0
+
+# Teto de trechos por corpo: acima disto o custo de escavar nao paga o ganho.
+MAX_REACHES = 48
+
+
+def _long_axis(body):
+    """Direcao do eixo maior do corpo, em graus. Zero quando indefinida."""
+    import math
+
+    try:
+        obb = body.minimum_rotated_rectangle
+        cantos = np.asarray(obb.exterior.coords, dtype=np.float64)[:-1]
+    except Exception:  # noqa: BLE001 - topologia ruim
+        return 0.0
+    if len(cantos) != 4:
+        return 0.0
+    lado_a, lado_b = cantos[1] - cantos[0], cantos[2] - cantos[1]
+    maior = lado_a if np.linalg.norm(lado_a) >= np.linalg.norm(lado_b) else lado_b
+    return math.degrees(math.atan2(float(maior[1]), float(maior[0])))
+
+
+def _slice_body(body, reach_m: float):
+    """Fatia o corpo em trechos ao longo do eixo maior, de montante a jusante.
+
+    Devolve a lista de pedacos na ordem do eixo. Corpo curto (lago, acude) volta
+    inteiro numa fatia so - fatiar um lago seria inventar desnivel onde a agua e
+    de fato uma superficie unica.
+    """
+    from shapely import affinity
+    from shapely.geometry import box as caixa
+
+    angulo = _long_axis(body)
+    centro = body.centroid
+    alinhado = affinity.rotate(body, -angulo, origin=centro)
+    minx, miny, maxx, maxy = alinhado.bounds
+    comprimento = maxx - minx
+    largura = maxy - miny
+
+    # Lago: tao largo quanto comprido. A agua parada tem um nivel so.
+    if comprimento < reach_m * 1.5 or comprimento < largura * 2.0:
+        return [body]
+
+    n = min(max(int(round(comprimento / reach_m)), 2), MAX_REACHES)
+    passo = comprimento / n
+
+    partes = []
+    for i in range(n):
+        faixa = caixa(minx + i * passo, miny - 1.0, minx + (i + 1) * passo, maxy + 1.0)
+        try:
+            pedaco = alinhado.intersection(faixa)
+        except Exception:  # noqa: BLE001 - topologia ruim: desiste de fatiar
+            return [body]
+        if pedaco.is_empty or pedaco.area < 1.0:
+            continue
+        partes.append(affinity.rotate(pedaco, angulo, origin=centro))
+    return partes or [body]
+
+
+def _reach_levels(partes, terrain) -> list[float]:
+    """Nivel de cada trecho, suavizado e obrigado a nao subir para jusante.
+
+    Duas coisas separam isto de medir cada trecho isoladamente:
+
+    - **suavizacao**: o DEM tem ruido, e trecho a trecho ele produz degraus de
+      alguns decimetros que aparecem como escada na lamina;
+    - **monotonia**: agua nao sobe. Jusante e a ponta mais baixa; dali para tras
+      cada trecho e obrigado a ficar no maximo no nivel do anterior. Sem isto um
+      pico de DEM no meio do rio levanta uma represa que nao existe.
+    """
+    brutos = [terrain.level_over(p, percentile=15.0) for p in partes]
+    if len(brutos) < 3:
+        return brutos
+
+    suaves = []
+    for i in range(len(brutos)):
+        janela = brutos[max(i - 1, 0) : i + 2]
+        suaves.append(float(np.mean(janela)))
+
+    # Jusante e a ponta mais baixa; percorre de montante para la.
+    if suaves[-1] <= suaves[0]:
+        for i in range(1, len(suaves)):
+            suaves[i] = min(suaves[i], suaves[i - 1])
+    else:
+        for i in range(len(suaves) - 2, -1, -1):
+            suaves[i] = min(suaves[i], suaves[i + 1])
+    return suaves
+
+
 def _generate_water_on_terrain(
     builder: MeshBuilder, ctx: GenerationContext, merged, por_id=None
 ):
-    """Agua sobre relevo: escava a grade e poe uma lamina plana por corpo d'agua.
+    """Agua sobre relevo: escava a grade e poe a lamina por trecho de rio.
 
-    Cada corpo tem o seu nivel, tirado do percentil baixo das alturas sob ele -
+    Cada trecho tem o seu nivel, tirado do percentil baixo das alturas sob ele -
     usar a media faria a agua subir a encosta em vales estreitos.
     """
     from shapely.geometry import MultiPolygon, Polygon
@@ -202,11 +298,32 @@ def _generate_water_on_terrain(
         bodies = [g for g in getattr(merged, "geoms", []) if isinstance(g, Polygon)]
 
     depth = abs(layers.Z_WATER_BED - layers.Z_WATER)
+    trechos = 0
     for body in bodies:
         if body.is_empty or body.area < 4.0:
             continue
-        level = terrain.level_over(body, percentile=15.0)
-        terrain.carve(body, depth=depth, level=level)
-        builder.add_flat(_material_for(ctx, body, por_id), body, level + layers.Z_WATER)
+        # O material sai do corpo inteiro, uma vez so: resolver por trecho faria
+        # o mesmo rio trocar de cor no meio.
+        material = _material_for(ctx, body, por_id)
+        partes = _slice_body(body, REACH_M)
+        niveis = _reach_levels(partes, terrain)
+        trechos += len(partes)
 
+        for i, (parte, nivel) in enumerate(zip(partes, niveis)):
+            # O leito e escavado ate o nivel do trecho **mais baixo da
+            # vizinhanca**, e nao ate o do proprio trecho.
+            #
+            # Escavar cada trecho ate o proprio nivel parece obvio e produz um
+            # acude a cada emenda: o leito do trecho de cima fica `profundidade`
+            # abaixo do nivel dele, o que ainda pode estar acima da lamina do
+            # trecho de baixo. Num vale com 1,3 m de queda por trecho e 0,5 m de
+            # lamina, sobra 0,8 m de leito seco atravessado no meio do rio.
+            # Medido na cena de teste: 106 de 328 vertices de leito acima da
+            # agua, mesmo com a escavacao ja corrigida dentro de cada trecho.
+            vizinho = min(niveis[max(i - 1, 0)], niveis[min(i + 1, len(niveis) - 1)])
+            terrain.carve(parte, depth=depth, level=min(nivel, vizinho))
+            builder.add_flat(material, parte, nivel + layers.Z_WATER)
+
+    if trechos > len(bodies):
+        log.info("Agua: %d corpos em %d trechos de nivel proprio", len(bodies), trechos)
     return merged
